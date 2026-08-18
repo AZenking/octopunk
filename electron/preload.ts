@@ -27,6 +27,8 @@ const INVOKE_ALLOWLIST = new Set([
   "settings:set-custom-instructions",
   "settings:get-disabled-agents",
   "settings:set-disabled-agents",
+  "settings:get-max-concurrent-tasks",
+  "settings:set-max-concurrent-tasks",
   "settings:get-skill-status",
   "settings:install-skill",
   "settings:connect-codex",
