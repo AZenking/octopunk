@@ -30,6 +30,7 @@ import {
   type ExecutionPolicyPayload,
   type MaxConcurrentTasksPayload,
 } from "../shared/ipc";
+import type { DiffPageDTO, DiffTreeEntryDTO } from "../shared/dtos";
 
 export interface RegisteredObservers {
   dispose: () => void;
@@ -148,6 +149,99 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
   handle("queries:execution-log", (payload) => {
     const request = payload as { runID: string; taskID: string };
     return environment.queryService.executionLogDetail(request.runID, request.taskID);
+  });
+
+  // Review Center (specs/002-v04 interfaces.md §C): same ReviewCenterService
+  // the MCP tools call, so GUI and MCP results are isomorphic for equal input.
+  handle("review:pending-list", () => environment.reviewCenter.pendingReviewTasks());
+
+  handle("review:get-diff", (payload): Promise<DiffTreeEntryDTO[] | DiffPageDTO> => {
+    const request = payload as {
+      runID: string;
+      taskID: string;
+      side: "baseline" | "worktree" | "integration";
+      path?: string;
+      cursor?: string | null;
+    };
+    // A file path selects the per-hunk paged view; without one the change
+    // tree is returned (the entry point the diff browser starts from).
+    if (request.path != null && request.path.length > 0) {
+      return environment.reviewCenter.getDiffPage(
+        request.runID,
+        request.taskID,
+        request.side,
+        request.path,
+        request.cursor ?? null,
+      );
+    }
+    return environment.reviewCenter.getDiffTree(request.runID, request.taskID, request.side);
+  });
+
+  handle("review:add-comments", (payload) => {
+    const request = payload as {
+      requestID?: string;
+      runID: string;
+      taskID: string;
+      comments: {
+        file: string;
+        lineStart: number;
+        lineEnd?: number;
+        body: string;
+        severity?: "info" | "risk";
+        author?: "user" | "claude_code" | "codex" | "pi";
+        contextSnapshot?: string;
+      }[];
+    };
+    return environment.reviewCenter.addComments({
+      requestID: request.requestID ?? randomUUID(),
+      runID: request.runID,
+      taskID: request.taskID,
+      comments: request.comments,
+    });
+  });
+
+  handle("review:rework-batch", (payload) => {
+    const request = payload as {
+      requestID?: string;
+      runID: string;
+      taskID: string;
+      commentIDs: string[];
+      summary: string;
+      reviewer?: string;
+    };
+    return environment.reviewCenter.reworkBatch({
+      requestID: request.requestID ?? randomUUID(),
+      runID: request.runID,
+      taskID: request.taskID,
+      commentIDs: request.commentIDs ?? [],
+      summary: request.summary ?? "",
+      reviewer: request.reviewer ?? "user",
+    });
+  });
+
+  handle("review:get-summary", (payload) => {
+    const request = payload as { runID: string; taskID?: string | null };
+    return environment.reviewCenter.getDeliverySummary(request.runID, request.taskID ?? null);
+  });
+
+  handle("review:generate-summary", (payload) => {
+    const request = payload as {
+      runID: string;
+      taskID?: string | null;
+      verdict: "PASS" | "REWORK" | "BLOCKED";
+      summaryLines?: string[];
+    };
+    return environment.reviewCenter.generateDeliverySummary({
+      runID: request.runID,
+      taskID: request.taskID ?? null,
+      verdict: request.verdict,
+      summaryLines: request.summaryLines,
+    });
+  });
+
+  handle("review:unresolved-findings", (payload) => {
+    const request = payload as { runID: string; taskID: string };
+    return environment.reviewCenter.unresolvedFindings(request.runID, request.taskID);
   });
 
   handle("team:join", (payload) => {

@@ -1,8 +1,18 @@
 // Port of OctoPunk/OctoPunk/Domain/Repositories/TeamRunRepository.swift.
 
 import type {
+  Arbitration,
+  ArbitrationDisagreement,
+  ArbitrationToVerify,
   ChildAgentKind,
   ChildTask,
+  DeliverySummary,
+  GateCheckKey,
+  GateCheckStatus,
+  GateOverall,
+  ReviewComment,
+  ReviewCommentAuthor,
+  ReviewCommentSeverity,
   ReviewFinding,
   ReviewVerdict,
   TaskExecutionMode,
@@ -106,6 +116,56 @@ export interface ReviewDecisionInput {
   verdict: ReviewVerdict;
   summary: string;
   findings: ReviewFinding[];
+}
+
+// ---- v0.4 review center & quality gates (specs/002-v04-review-center-gates) ----
+
+/** Persistable shape of one line-anchored review comment (specs/002 data-model). */
+export interface ReviewCommentDraft {
+  filePath: string;
+  lineStart: number;
+  lineEnd?: number;
+  /** Anchor-line content snapshot (≤2 KiB) captured by the caller. */
+  contextSnapshot: string;
+  body: string;
+  severity: ReviewCommentSeverity;
+  author: ReviewCommentAuthor;
+}
+
+/** Per-check gate outcome (gate_evaluation_items rows). Pure data. */
+export interface GateEvaluationItem {
+  id: string;
+  evaluationID: string;
+  checkKey: GateCheckKey;
+  /** `unknown` marks timeout/unverifiable checks; it never blocks by itself. */
+  status: GateCheckStatus;
+  detail: string;
+  fixSuggestion: string | null;
+  waivedBy: string | null;
+  waivedReason: string | null;
+  waivedAt: number | null;
+}
+
+/** Full gate judgement with its per-check items (gate_evaluations + items). */
+export interface GateEvaluation {
+  id: string;
+  runID: string;
+  taskID: string;
+  requestID: string;
+  /** pass / fail / waived (recalculated to `waived` once every fail item is waived). */
+  overall: GateOverall;
+  evaluatedAt: number;
+  items: GateEvaluationItem[];
+}
+
+/** GitHub PR write-back link (pr_links; one per run+task, upserted). */
+export interface PrLink {
+  id: string;
+  runID: string;
+  taskID: string;
+  prURL: string;
+  prNumber: number;
+  lastSyncedAt: number;
 }
 
 /** Minimal observation contract shared by all segmented queries (constitution I). */
@@ -258,6 +318,87 @@ export interface TeamRunRepository {
     requesterTaskID: string;
     targetTaskID: string;
   }): Promise<TaskReportPayload>;
+  // ---- v0.4 review center & quality gates (specs/002-v04-review-center-gates) ----
+  /**
+   * Batch-inserts line-anchored review comments in one transaction. Anchors
+   * must belong to the task's diff — that validation lives in the service
+   * layer; the repository only persists.
+   */
+  addReviewComments(input: {
+    requestID: string;
+    runID: string;
+    taskID: string;
+    comments: ReviewCommentDraft[];
+  }): Promise<ReviewComment[]>;
+  listReviewComments(runID: string, taskID: string): Promise<ReviewComment[]>;
+  /** Unresolved findings across the run's tasks; risk-severity entries first. */
+  listOpenReviewComments(runID: string): Promise<ReviewComment[]>;
+  /**
+   * Moves an `open` comment to a terminal state. Invalid transitions throw
+   * `DomainError.invalidTransition` (terminal states are irreversible).
+   */
+  setReviewCommentStatus(input: {
+    requestID: string;
+    runID: string;
+    commentID: string;
+    status: "resolved" | "dismissed" | "line_changed";
+  }): Promise<ReviewComment>;
+  /** Project-default gate config; null when the project never saved one. */
+  getGateConfig(repositoryPath: string): Promise<{ configJson: string; updatedAt: number } | null>;
+  saveGateConfig(input: { repositoryPath: string; configJson: string; updatedAt: number }): Promise<void>;
+  /** Idempotent: replaying the same requestID returns the cached evaluation. */
+  recordGateEvaluation(input: {
+    requestID: string;
+    runID: string;
+    taskID: string;
+    overall: GateOverall;
+    items: {
+      checkKey: GateCheckKey;
+      status: GateCheckStatus;
+      detail: string;
+      fixSuggestion?: string | null;
+    }[];
+  }): Promise<GateEvaluation>;
+  getLatestGateEvaluation(runID: string, taskID: string): Promise<GateEvaluation | null>;
+  /** Items of one evaluation — the read model for service-layer overall recalc. */
+  listGateEvaluationItems(evaluationID: string): Promise<GateEvaluationItem[]>;
+  /** Marks one failed item as waived with a per-item audit trail. */
+  waiveGateItem(input: {
+    requestID: string;
+    evaluationID: string;
+    itemID: string;
+    waivedBy: string;
+    waivedReason: string;
+  }): Promise<GateEvaluationItem>;
+  recordArbitration(input: {
+    runID: string;
+    taskID: string;
+    consensus: string;
+    disagreements: ArbitrationDisagreement[];
+    toVerify: ArbitrationToVerify[];
+    autoPassed: boolean;
+  }): Promise<Arbitration>;
+  getArbitration(runID: string, taskID: string): Promise<Arbitration | null>;
+  /** taskID null records the run-level final-review summary. */
+  recordDeliverySummary(input: {
+    runID: string;
+    taskID: string | null;
+    verdict: ReviewVerdict;
+    summaryMd: string;
+    evidence: string[];
+  }): Promise<DeliverySummary>;
+  getDeliverySummary(runID: string, taskID: string | null): Promise<DeliverySummary | null>;
+  /** Upserts the (single) PR write-back link of a run+task. */
+  savePrLink(input: {
+    runID: string;
+    taskID: string;
+    prURL: string;
+    prNumber: number;
+    lastSyncedAt?: number;
+  }): Promise<PrLink>;
+  getPrLink(runID: string, taskID: string): Promise<PrLink | null>;
+  /** Freezes the run's effective gates into team_runs.gate_snapshot_json. */
+  saveRunGateSnapshot(runID: string, snapshotJson: string): Promise<void>;
 }
 
 export type { TeamRun, TaskExecutionReport };

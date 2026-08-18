@@ -16,6 +16,7 @@ import type {
   ReviewDecisionInput,
   StartTeamInput,
 } from "../domain/repositoryPort";
+import type { ReviewCenterService } from "../application/reviewCenterService";
 
 /** Read-only live context supply for sub-agents (spec 001 FR-005…FR-008). */
 export interface ReadOnlyContextPort {
@@ -62,4 +63,11 @@ export interface AgentTeamServicePortLike {
   discardTeam(input: { requestID: string; runID: string }): Promise<TeamStatusDTO>;
   archiveTeam(input: { requestID: string; runID: string }): Promise<void>;
   unarchiveTeam(input: { requestID: string; runID: string }): Promise<void>;
+  /**
+   * Review Center use cases (task diff, line-anchored comments, batch rework,
+   * delivery summary) shared by GUI and MCP (constitution principle two).
+   * Optional: appEnvironment wires the instance; until then the MCP Review
+   * Center tools answer with a readable error instead of failing to build.
+   */
+  reviewCenter?: ReviewCenterService;
 }

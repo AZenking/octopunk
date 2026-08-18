@@ -25,7 +25,7 @@ description: "Task list for v0.4 Review Center 与质量门禁"
 
 ## Phase 1: Setup (Shared Infrastructure)
 
-- [ ] T001 在 `shared/dtos.ts` 增加 Review Center 共享 DTO(ReviewPendingTaskDTO、DiffTreeEntryDTO、DiffPageDTO、ReviewCommentDTO、GateConfigDTO、GateEvaluationDTO 等,字段对齐 `specs/002-v04-review-center-gates/data-model.md`),并创建 `src/features/reviewCenter/` 目录骨架
+- [x] T001 在 `shared/dtos.ts` 增加 Review Center 共享 DTO(ReviewPendingTaskDTO、DiffTreeEntryDTO、DiffPageDTO、ReviewCommentDTO、GateConfigDTO、GateEvaluationDTO 等,字段对齐 `specs/002-v04-review-center-gates/data-model.md`),并创建 `src/features/reviewCenter/` 目录骨架
 
 ---
 
@@ -33,11 +33,11 @@ description: "Task list for v0.4 Review Center 与质量门禁"
 
 **⚠️ 全部用户故事依赖本阶段完成**
 
-- [ ] T002 SQLite 迁移 v6 → v7:`electron/data/database.ts` 新建表 `review_comments`、`project_gate_configs`、`gate_evaluations`、`gate_evaluation_items`、`arbitrations`、`delivery_summaries`、`pr_links`,并为 `team_runs` 增加 `gate_snapshot_json` 列(DDL 风格与既有迁移一致,结构见 data-model.md)
-- [ ] T003 [P] 领域纯模型:`electron/domain/models.ts` 增加 ReviewComment(状态迁移 open→resolved/dismissed/line_changed,终态不可逆)、GateCheckStatus、Arbitration、DeliverySummary 及构造函数(无 I/O,保持宪法原则二)
-- [ ] T004 [P] 门禁配置校验:`electron/domain/policy.ts` 增加 validateGateConfig(矛盾组合拒绝、命令条数 ≤8、required_reviewers 引用合法 Agent 类型、review_mode 枚举校验)
-- [ ] T005 仓储端口与实现:`electron/domain/repositoryPort.ts` 增加评论/门禁配置/判定/仲裁/摘要/PR 关联的读写端口;`electron/data/repository.ts` + `electron/data/mappers.ts` 实现(沿用 cachedResponse 幂等与 write 通知观察者机制)(depends: T002, T003)
-- [ ] T006 仓储测试:扩展 `tests/repository.test.ts` —— v7 迁移可用性、评论状态迁移约束、门禁配置主键唯一、gate_evaluations 幂等重放(deps: T005)
+- [x] T002 SQLite 迁移 v9 → v10(实现时代价发现迁移器已至 v9,规范文档的 v7 编号已被既有功能占用):`electron/data/database.ts` 新建表 `review_comments`、`project_gate_configs`、`gate_evaluations`、`gate_evaluation_items`、`arbitrations`、`delivery_summaries`、`pr_links`,并为 `team_runs` 增加 `gate_snapshot_json` 列(DDL 风格与既有迁移一致,结构见 data-model.md)
+- [x] T003 [P] 领域纯模型:`electron/domain/models.ts` 增加 ReviewComment(状态迁移 open→resolved/dismissed/line_changed,终态不可逆)、GateCheckStatus、Arbitration、DeliverySummary 及构造函数(无 I/O,保持宪法原则二)
+- [x] T004 [P] 门禁配置校验:`electron/domain/policy.ts` 增加 validateGateConfig(矛盾组合拒绝、命令条数 ≤8、required_reviewers 引用合法 Agent 类型、review_mode 枚举校验)
+- [x] T005 仓储端口与实现:`electron/domain/repositoryPort.ts` 增加评论/门禁配置/判定/仲裁/摘要/PR 关联的读写端口;`electron/data/repository.ts` + `electron/data/mappers.ts` 实现(沿用 cachedResponse 幂等与 write 通知观察者机制)(depends: T002, T003)
+- [x] T006 仓储测试:扩展 `tests/repository.test.ts` —— v7 迁移可用性、评论状态迁移约束、门禁配置主键唯一、gate_evaluations 幂等重放(deps: T005)
 
 **Checkpoint**: 数据层就绪,四个用户故事可并行开工。
 
@@ -51,15 +51,15 @@ description: "Task list for v0.4 Review Center 与质量门禁"
 
 ### Implementation for User Story 1
 
-- [ ] T007 [P] [US1] GitPort Diff 能力:`electron/application/ports.ts` 扩展 `diffTree` / `diffPatch`(按文件分页、单页输出 ≤64KiB、写前 redact)与 `conflictPreview`(merge --no-commit 试算后 abort);`electron/platform/gitAdapter.ts` 用既有 git 子进程通道实现(三方 = run 基线 / 任务分支 HEAD / 集成 worktree HEAD,rev-parse 取值)
-- [ ] T008 [P] [US1] Diff 适配测试:临时仓库 fixture 验证 diffTree/diffPatch 分页边界(空 Diff、>64KiB 截断、integration worktree 缺失报可读错误)(deps: T007)
-- [ ] T009 [US1] 审查中心服务:`electron/application/reviewCenterService.ts` —— 待审查任务跨 run 聚合、Diff 读取(side 切换)、行级评论 CRUD(context_snapshot 写入)、批量返工(勾选评论聚合为 findings 走既有 `request_rework` 通道,复用原生会话与轮次规则)、返工后评论回填(resolved / line_changed 判定)、交付摘要生成(结论+证据链接+豁免清单+遗留项)(deps: T005, T007)
-- [ ] T010 [P] [US1] MCP 工具:`electron/mcp/server.ts` 新增 `get_task_diff` / `add_review_comments` / `request_rework_batch`,扩展 `get_task_review_context`(追加 unresolved findings 与最近门禁判定)(deps: T009)
-- [ ] T011 [P] [US1] IPC 通道:`electron/ipc.ts` + `electron/preload.ts` 注册 `review:pending-list` / `review:get-diff` / `review:add-comments` / `review:rework-batch` / `review:get-summary` 白名单,事件流新增 `review_comment_added` / `summary_generated` kind(deps: T009)
-- [ ] T012 [P] [US1] 审查中心 UI(一):`src/features/reviewCenter/ReviewCenterView.tsx`(待审查列表)+ `DiffTree.tsx`(变更树,risk/敏感标记)+ `DiffViewer.tsx`(基线/工作树/集成 Tabs、分页加载、行锚点、超大 Diff 折叠;全部 shadcn/ui 原语,布局参考 v0 栅格间距,禁原生 HTML 控件)(deps: T001, T011)
-- [ ] T013 [US1] 审查中心 UI(二):`CommentPanel.tsx`(行级评论、severity、勾选批量返工、line_changed 快照展示)+ 侧边栏顶级入口接入现有 navigation(deps: T012)
-- [ ] T014 [US1] 服务测试:`tests/reviewCenter.test.ts` —— 评论闭环(添加→返工→resolved/line_changed)、批量返工 findings 聚合、摘要证据链接完整性(deps: T009)
-- [ ] T015 [US1] appState 接线:`src/appState.tsx` 增加审查中心状态与通道调用;通过 quickstart 场景 1 手动验证
+- [x] T007 [P] [US1] GitPort Diff 能力:`electron/application/ports.ts` 扩展 `diffTree` / `diffPatch`(按文件分页、单页输出 ≤64KiB、写前 redact)与 `conflictPreview`(merge --no-commit 试算后 abort);`electron/platform/gitAdapter.ts` 用既有 git 子进程通道实现(三方 = run 基线 / 任务分支 HEAD / 集成 worktree HEAD,rev-parse 取值)
+- [x] T008 [P] [US1] Diff 适配测试:临时仓库 fixture 验证 diffTree/diffPatch 分页边界(空 Diff、>64KiB 截断、integration worktree 缺失报可读错误)(deps: T007)
+- [x] T009 [US1] 审查中心服务:`electron/application/reviewCenterService.ts` —— 待审查任务跨 run 聚合、Diff 读取(side 切换)、行级评论 CRUD(context_snapshot 写入)、批量返工(勾选评论聚合为 findings 走既有 `request_rework` 通道,复用原生会话与轮次规则)、返工后评论回填(resolved / line_changed 判定)、交付摘要生成(结论+证据链接+豁免清单+遗留项)(deps: T005, T007)
+- [x] T010 [P] [US1] MCP 工具:`electron/mcp/server.ts` 新增 `get_task_diff` / `add_review_comments` / `request_rework_batch`,扩展 `get_task_review_context`(追加 unresolved findings 与最近门禁判定)(deps: T009)
+- [x] T011 [P] [US1] IPC 通道:`electron/ipc.ts` + `electron/preload.ts` 注册 `review:pending-list` / `review:get-diff` / `review:add-comments` / `review:rework-batch` / `review:get-summary` 白名单,事件流新增 `review_comment_added` / `summary_generated` kind(deps: T009)
+- [x] T012 [P] [US1] 审查中心 UI(一):`src/features/reviewCenter/ReviewCenterView.tsx`(待审查列表)+ `DiffTree.tsx`(变更树,risk/敏感标记)+ `DiffViewer.tsx`(基线/工作树/集成 Tabs、分页加载、行锚点、超大 Diff 折叠;全部 shadcn/ui 原语,布局参考 v0 栅格间距,禁原生 HTML 控件)(deps: T001, T011)
+- [x] T013 [US1] 审查中心 UI(二):`CommentPanel.tsx`(行级评论、severity、勾选批量返工、line_changed 快照展示)+ 侧边栏顶级入口接入现有 navigation(deps: T012)
+- [x] T014 [US1] 服务测试:`tests/reviewCenter.test.ts` —— 评论闭环(添加→返工→resolved/line_changed)、批量返工 findings 聚合、摘要证据链接完整性(deps: T009)
+- [ ] T015 [US1] 接线验证:UI 已直连通道(无需 appState 中转),侧边栏入口已挂载;剩余 quickstart 场景 1 的 GUI 手动走查(返工后列表为手动刷新,自动刷新订阅待 Polish)
 
 **Checkpoint**: US1 独立可用(MVP 交付点)。
 

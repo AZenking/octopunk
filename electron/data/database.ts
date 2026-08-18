@@ -8,7 +8,7 @@ import Database from "better-sqlite3";
 export type SqliteDatabase = Database.Database;
 
 export const OctoPunkDatabaseMigrator = {
-  currentVersion: 9,
+  currentVersion: 10,
 
   migrate(db: SqliteDatabase): void {
     const currentVersion = OctoPunkDatabaseMigrator.readVersion(db);
@@ -265,6 +265,97 @@ export const OctoPunkDatabaseMigrator = {
       // the agent's own default), so legacy rows need no backfill.
       db.exec("ALTER TABLE child_tasks ADD COLUMN model TEXT");
       updateSchemaVersion(db, "9");
+    },
+
+    10(db: SqliteDatabase): void {
+      // Review Center & quality gates: line-anchored review comments, per-
+      // repository gate defaults, gate evaluations with their per-check
+      // items, arbitration outcomes, delivery summaries and PR write-back
+      // links. Runs freeze their effective gates at start; NULL on legacy
+      // rows means "no gates configured", which is not a failure.
+      db.exec(`
+        CREATE TABLE review_comments (
+            id TEXT PRIMARY KEY NOT NULL,
+            run_id TEXT NOT NULL REFERENCES team_runs(id) ON DELETE CASCADE,
+            task_id TEXT NOT NULL REFERENCES child_tasks(id) ON DELETE CASCADE,
+            review_round INTEGER NOT NULL,
+            file_path TEXT NOT NULL,
+            line_start INTEGER NOT NULL,
+            line_end INTEGER NOT NULL,
+            context_snapshot TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL,
+            severity TEXT NOT NULL DEFAULT 'info',
+            author TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+
+        CREATE TABLE project_gate_configs (
+            repository_path TEXT PRIMARY KEY NOT NULL,
+            config_json TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        );
+
+        CREATE TABLE gate_evaluations (
+            id TEXT PRIMARY KEY NOT NULL,
+            run_id TEXT NOT NULL REFERENCES team_runs(id) ON DELETE CASCADE,
+            task_id TEXT NOT NULL REFERENCES child_tasks(id) ON DELETE CASCADE,
+            request_id TEXT NOT NULL,
+            overall TEXT NOT NULL,
+            evaluated_at REAL NOT NULL,
+            UNIQUE(request_id)
+        );
+
+        CREATE TABLE gate_evaluation_items (
+            id TEXT PRIMARY KEY NOT NULL,
+            evaluation_id TEXT NOT NULL REFERENCES gate_evaluations(id) ON DELETE CASCADE,
+            check_key TEXT NOT NULL,
+            status TEXT NOT NULL,
+            detail TEXT NOT NULL DEFAULT '',
+            fix_suggestion TEXT,
+            waived_by TEXT,
+            waived_reason TEXT,
+            waived_at REAL
+        );
+
+        CREATE TABLE arbitrations (
+            id TEXT PRIMARY KEY NOT NULL,
+            run_id TEXT NOT NULL REFERENCES team_runs(id) ON DELETE CASCADE,
+            task_id TEXT NOT NULL REFERENCES child_tasks(id) ON DELETE CASCADE,
+            consensus TEXT NOT NULL,
+            disagreements_json TEXT NOT NULL DEFAULT '[]',
+            to_verify_json TEXT NOT NULL DEFAULT '[]',
+            auto_passed INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL
+        );
+
+        CREATE TABLE delivery_summaries (
+            id TEXT PRIMARY KEY NOT NULL,
+            run_id TEXT NOT NULL REFERENCES team_runs(id) ON DELETE CASCADE,
+            task_id TEXT REFERENCES child_tasks(id) ON DELETE CASCADE,
+            verdict TEXT NOT NULL,
+            summary_md TEXT NOT NULL,
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL
+        );
+
+        CREATE TABLE pr_links (
+            id TEXT PRIMARY KEY NOT NULL,
+            run_id TEXT NOT NULL REFERENCES team_runs(id) ON DELETE CASCADE,
+            task_id TEXT NOT NULL REFERENCES child_tasks(id) ON DELETE CASCADE,
+            pr_url TEXT NOT NULL,
+            pr_number INTEGER NOT NULL,
+            last_synced_at REAL NOT NULL
+        );
+
+        ALTER TABLE team_runs ADD COLUMN gate_snapshot_json TEXT;
+
+        CREATE INDEX review_comments_task_status_idx ON review_comments(task_id, status);
+        CREATE INDEX review_comments_run_idx ON review_comments(run_id);
+        CREATE INDEX delivery_summaries_task_idx ON delivery_summaries(task_id);
+      `);
+      updateSchemaVersion(db, "10");
     },
   } as Record<number, (db: SqliteDatabase) => void>,
 };

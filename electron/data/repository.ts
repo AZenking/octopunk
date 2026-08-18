@@ -11,10 +11,13 @@ import { DatabaseMappers, allRows, oneRow, parseStringArray } from "./mappers";
 import { sharedReadOnlyWorktreeURL, taskWorktreeRoot, integrationWorktreeURL } from "../platform/gitAdapter";
 import { DomainError } from "../domain/models";
 import type {
+  Arbitration,
   ChildTask,
   ContextFetchDigest,
   ContextTaskDigest,
+  DeliverySummary,
   RelayEvent,
+  ReviewComment,
   ReviewFinding,
   RunSummary,
   TaskAttempt,
@@ -27,6 +30,10 @@ import type {
   TeamRunSummary,
 } from "../domain/models";
 import {
+  canTransitionReviewComment,
+  makeArbitration,
+  makeDeliverySummary,
+  makeReviewComment,
   renderTeamContextSummary,
   taskStatusIsTerminal,
   runStatusIsTerminal,
@@ -44,6 +51,10 @@ import {
   type DelegateTaskInput,
   type DelegateTasksInput,
   type DelegateTasksResult,
+  type GateEvaluation,
+  type GateEvaluationItem,
+  type PrLink,
+  type ReviewCommentDraft,
   type ReviewDecisionInput,
   type StartTeamInput,
   type TaskExecutionEventInput,
@@ -1073,6 +1084,463 @@ export class SqliteTeamRunRepository implements TeamRunRepository {
     }, [input.runID]);
   }
 
+  // MARK: - v0.4 review center & quality gates (specs/002-v04-review-center-gates)
+
+  async addReviewComments(input: {
+    requestID: string;
+    runID: string;
+    taskID: string;
+    comments: ReviewCommentDraft[];
+  }): Promise<ReviewComment[]> {
+    return this.write((db) => {
+      const cached = cachedResponse<ReviewComment[]>(db, input.requestID);
+      if (cached) return cached;
+      // Stamps the review round; anchor-in-diff validation stays in the service.
+      const task = requireTaskSync(db, input.taskID, input.runID);
+      const created = input.comments.map((comment) =>
+        makeReviewComment({
+          runID: input.runID,
+          taskID: input.taskID,
+          reviewRound: task.reviewRound,
+          filePath: comment.filePath,
+          lineStart: comment.lineStart,
+          lineEnd: comment.lineEnd,
+          contextSnapshot: comment.contextSnapshot,
+          body: comment.body,
+          severity: comment.severity,
+          author: comment.author,
+        }),
+      );
+      const insert = db.prepare(
+        `INSERT INTO review_comments(
+            id, run_id, task_id, review_round, file_path, line_start, line_end,
+            context_snapshot, body, severity, author, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const comment of created) {
+        insert.run(
+          comment.id,
+          comment.runID,
+          comment.taskID,
+          comment.reviewRound,
+          comment.filePath,
+          comment.lineStart,
+          comment.lineEnd,
+          comment.contextSnapshot,
+          comment.body,
+          comment.severity,
+          comment.author,
+          comment.status,
+          comment.createdAt,
+          comment.updatedAt,
+        );
+      }
+      appendEvent(db, {
+        runID: input.runID,
+        taskID: input.taskID,
+        kind: TeamEventKind.reviewCommentAdded,
+        payload: encodeTeamEventPayload(
+          makeTeamEventPayload(`Added ${created.length} review comment(s)`, input.requestID, {
+            task_id: input.taskID,
+            count: String(created.length),
+          }),
+        ),
+      });
+      saveResponse(db, input.requestID, created);
+      return created;
+    }, [input.runID]);
+  }
+
+  async listReviewComments(runID: string, taskID: string): Promise<ReviewComment[]> {
+    return allRows(
+      this.db,
+      "SELECT * FROM review_comments WHERE run_id = ? AND task_id = ? ORDER BY created_at, rowid",
+      runID,
+      taskID,
+    ).map(DatabaseMappers.reviewComment);
+  }
+
+  async listOpenReviewComments(runID: string): Promise<ReviewComment[]> {
+    // risk severity sorts above info (spec: risk findings stay on top).
+    return allRows(
+      this.db,
+      "SELECT * FROM review_comments WHERE run_id = ? AND status = ? ORDER BY severity DESC, created_at, rowid",
+      runID,
+      "open",
+    ).map(DatabaseMappers.reviewComment);
+  }
+
+  async setReviewCommentStatus(input: {
+    requestID: string;
+    runID: string;
+    commentID: string;
+    status: "resolved" | "dismissed" | "line_changed";
+  }): Promise<ReviewComment> {
+    return this.write((db) => {
+      const cached = cachedResponse<ReviewComment>(db, input.requestID);
+      if (cached) return cached;
+      const comment = reviewCommentSync(db, input.runID, input.commentID);
+      if (!canTransitionReviewComment(comment.status, input.status)) {
+        // Terminal states are irreversible (specs/002 data-model).
+        throw DomainError.invalidTransition("ReviewComment", comment.status, input.status);
+      }
+      db.prepare("UPDATE review_comments SET status = ?, updated_at = ? WHERE id = ?").run(
+        input.status,
+        nowSeconds(),
+        input.commentID,
+      );
+      appendEvent(db, {
+        runID: input.runID,
+        taskID: comment.taskID,
+        kind: TeamEventKind.reviewCommentStatusChanged,
+        payload: encodeTeamEventPayload(
+          makeTeamEventPayload(`Review comment ${comment.id} → ${input.status}`, input.requestID, {
+            comment_id: comment.id,
+            from: comment.status,
+            to: input.status,
+          }),
+        ),
+      });
+      const updated = reviewCommentSync(db, input.runID, input.commentID);
+      saveResponse(db, input.requestID, updated);
+      return updated;
+    }, [input.runID]);
+  }
+
+  async getGateConfig(repositoryPath: string): Promise<{ configJson: string; updatedAt: number } | null> {
+    const row = oneRow(
+      this.db,
+      "SELECT config_json, updated_at FROM project_gate_configs WHERE repository_path = ?",
+      repositoryPath,
+    );
+    return row == null ? null : DatabaseMappers.gateConfig(row);
+  }
+
+  async saveGateConfig(input: {
+    repositoryPath: string;
+    configJson: string;
+    updatedAt: number;
+  }): Promise<void> {
+    // Structure/contradiction validation happens in the service (policy); the
+    // repository persists the opaque JSON document as-is.
+    this.write((db) => {
+      db.prepare(
+        `INSERT INTO project_gate_configs(repository_path, config_json, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(repository_path) DO UPDATE SET
+            config_json = excluded.config_json,
+            updated_at = excluded.updated_at`,
+      ).run(input.repositoryPath, input.configJson, input.updatedAt);
+    }, []);
+  }
+
+  async recordGateEvaluation(input: {
+    requestID: string;
+    runID: string;
+    taskID: string;
+    overall: GateEvaluation["overall"];
+    items: {
+      checkKey: GateEvaluationItem["checkKey"];
+      status: GateEvaluationItem["status"];
+      detail: string;
+      fixSuggestion?: string | null;
+    }[];
+  }): Promise<GateEvaluation> {
+    return this.write((db) => {
+      const cached = cachedResponse<GateEvaluation>(db, input.requestID);
+      if (cached) return cached;
+      requireTaskSync(db, input.taskID, input.runID);
+      const evaluationID = randomUUID();
+      const evaluatedAt = nowSeconds();
+      db.prepare(
+        `INSERT INTO gate_evaluations(id, run_id, task_id, request_id, overall, evaluated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run(evaluationID, input.runID, input.taskID, input.requestID, input.overall, evaluatedAt);
+      const insertItem = db.prepare(
+        `INSERT INTO gate_evaluation_items(id, evaluation_id, check_key, status, detail, fix_suggestion)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      );
+      const items: GateEvaluationItem[] = input.items.map((item) => {
+        const itemID = randomUUID();
+        insertItem.run(itemID, evaluationID, item.checkKey, item.status, item.detail, item.fixSuggestion ?? null);
+        return {
+          id: itemID,
+          evaluationID,
+          checkKey: item.checkKey,
+          status: item.status,
+          detail: item.detail,
+          fixSuggestion: item.fixSuggestion ?? null,
+          waivedBy: null,
+          waivedReason: null,
+          waivedAt: null,
+        };
+      });
+      appendEvent(db, {
+        runID: input.runID,
+        taskID: input.taskID,
+        kind: TeamEventKind.gateEvaluated,
+        payload: encodeTeamEventPayload(
+          makeTeamEventPayload(`Quality gate ${input.overall}`, input.requestID, {
+            overall: input.overall,
+            item_count: String(items.length),
+          }),
+        ),
+      });
+      const result: GateEvaluation = {
+        id: evaluationID,
+        runID: input.runID,
+        taskID: input.taskID,
+        requestID: input.requestID,
+        overall: input.overall,
+        evaluatedAt,
+        items,
+      };
+      saveResponse(db, input.requestID, result);
+      return result;
+    }, [input.runID]);
+  }
+
+  async getLatestGateEvaluation(runID: string, taskID: string): Promise<GateEvaluation | null> {
+    const row = oneRow(
+      this.db,
+      "SELECT * FROM gate_evaluations WHERE run_id = ? AND task_id = ? ORDER BY evaluated_at DESC, rowid DESC LIMIT 1",
+      runID,
+      taskID,
+    );
+    if (row == null) return null;
+    return DatabaseMappers.gateEvaluation(row, gateItemsSync(this.db, row.id as string));
+  }
+
+  async listGateEvaluationItems(evaluationID: string): Promise<GateEvaluationItem[]> {
+    return gateItemsSync(this.db, evaluationID);
+  }
+
+  async waiveGateItem(input: {
+    requestID: string;
+    evaluationID: string;
+    itemID: string;
+    waivedBy: string;
+    waivedReason: string;
+  }): Promise<GateEvaluationItem> {
+    // Notification scope needs the owning run before the transaction opens.
+    const evaluationRow = oneRow(
+      this.db,
+      "SELECT run_id FROM gate_evaluations WHERE id = ?",
+      input.evaluationID,
+    );
+    if (evaluationRow == null) {
+      throw DomainError.invalidTask(`Gate evaluation not found: ${input.evaluationID}`);
+    }
+    return this.write((db) => {
+      const cached = cachedResponse<GateEvaluationItem>(db, input.requestID);
+      if (cached) return cached;
+      const itemRow = oneRow(
+        db,
+        "SELECT * FROM gate_evaluation_items WHERE id = ? AND evaluation_id = ?",
+        input.itemID,
+        input.evaluationID,
+      );
+      if (itemRow == null) {
+        throw DomainError.invalidTask(`Gate evaluation item not found: ${input.itemID}`);
+      }
+      // Keep the original verdict visible: the trail records who/when/why while
+      // the service layer recalculates `overall` from the full item list.
+      db.prepare(
+        `UPDATE gate_evaluation_items
+         SET status = 'waived', waived_by = ?, waived_reason = ?, waived_at = ?
+         WHERE id = ?`,
+      ).run(input.waivedBy, input.waivedReason, nowSeconds(), input.itemID);
+      const evaluation = oneRow(db, "SELECT * FROM gate_evaluations WHERE id = ?", input.evaluationID);
+      appendEvent(db, {
+        runID: (evaluation?.run_id as string) ?? "",
+        taskID: (evaluation?.task_id as string) ?? null,
+        kind: TeamEventKind.gateItemWaived,
+        payload: encodeTeamEventPayload(
+          makeTeamEventPayload(`Waived gate item ${input.itemID}`, input.requestID, {
+            evaluation_id: input.evaluationID,
+            item_id: input.itemID,
+            check_key: itemRow.check_key as string,
+            waived_by: input.waivedBy,
+          }),
+        ),
+      });
+      const updated = oneRow(db, "SELECT * FROM gate_evaluation_items WHERE id = ?", input.itemID);
+      const result = DatabaseMappers.gateEvaluationItem(updated as Row);
+      saveResponse(db, input.requestID, result);
+      return result;
+    }, [evaluationRow.run_id as string]);
+  }
+
+  async recordArbitration(input: {
+    runID: string;
+    taskID: string;
+    consensus: string;
+    disagreements: Arbitration["disagreements"];
+    toVerify: Arbitration["toVerify"];
+    autoPassed: boolean;
+  }): Promise<Arbitration> {
+    return this.write((db) => {
+      requireTaskSync(db, input.taskID, input.runID);
+      const record = makeArbitration({
+        runID: input.runID,
+        taskID: input.taskID,
+        consensus: input.consensus,
+        disagreements: input.disagreements,
+        toVerify: input.toVerify,
+        autoPassed: input.autoPassed,
+      });
+      db.prepare(
+        `INSERT INTO arbitrations(
+            id, run_id, task_id, consensus, disagreements_json, to_verify_json, auto_passed, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        record.id,
+        record.runID,
+        record.taskID,
+        record.consensus,
+        stableStringify(record.disagreements),
+        stableStringify(record.toVerify),
+        record.autoPassed ? 1 : 0,
+        record.createdAt,
+      );
+      appendEvent(db, {
+        runID: input.runID,
+        taskID: input.taskID,
+        kind: TeamEventKind.arbitrationRecorded,
+        payload: encodeTeamEventPayload(
+          makeTeamEventPayload("Arbitration outcome recorded", null, {
+            task_id: input.taskID,
+            disagreement_count: String(record.disagreements.length),
+            auto_passed: String(record.autoPassed),
+          }),
+        ),
+      });
+      return record;
+    }, [input.runID]);
+  }
+
+  async getArbitration(runID: string, taskID: string): Promise<Arbitration | null> {
+    const row = oneRow(
+      this.db,
+      "SELECT * FROM arbitrations WHERE run_id = ? AND task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+      runID,
+      taskID,
+    );
+    return row == null ? null : DatabaseMappers.arbitration(row);
+  }
+
+  async recordDeliverySummary(input: {
+    runID: string;
+    taskID: string | null;
+    verdict: DeliverySummary["verdict"];
+    summaryMd: string;
+    evidence: string[];
+  }): Promise<DeliverySummary> {
+    return this.write((db) => {
+      requireRunSync(db, input.runID);
+      if (input.taskID != null) requireTaskSync(db, input.taskID, input.runID);
+      const record = makeDeliverySummary({
+        runID: input.runID,
+        taskID: input.taskID,
+        verdict: input.verdict,
+        summaryMD: input.summaryMd,
+        evidence: input.evidence,
+      });
+      db.prepare(
+        `INSERT INTO delivery_summaries(id, run_id, task_id, verdict, summary_md, evidence_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        record.id,
+        record.runID,
+        record.taskID,
+        record.verdict,
+        record.summaryMD,
+        stableStringify(record.evidence),
+        record.createdAt,
+      );
+      appendEvent(db, {
+        runID: input.runID,
+        taskID: input.taskID,
+        kind: TeamEventKind.summaryGenerated,
+        payload: encodeTeamEventPayload(
+          makeTeamEventPayload(`Delivery summary generated: ${record.verdict}`, null, {
+            verdict: record.verdict,
+            evidence_count: String(record.evidence.length),
+          }),
+        ),
+      });
+      return record;
+    }, [input.runID]);
+  }
+
+  async getDeliverySummary(runID: string, taskID: string | null): Promise<DeliverySummary | null> {
+    // `IS ?` matches NULL task ids for the run-level final summary.
+    const row = oneRow(
+      this.db,
+      "SELECT * FROM delivery_summaries WHERE run_id = ? AND task_id IS ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+      runID,
+      taskID,
+    );
+    if (row == null) return null;
+    return DatabaseMappers.deliverySummary(row, parseStringArray(row.evidence_json) ?? []);
+  }
+
+  async savePrLink(input: {
+    runID: string;
+    taskID: string;
+    prURL: string;
+    prNumber: number;
+    lastSyncedAt?: number;
+  }): Promise<PrLink> {
+    return this.write((db) => {
+      requireTaskSync(db, input.taskID, input.runID);
+      const lastSyncedAt = input.lastSyncedAt ?? nowSeconds();
+      const existing = oneRow(
+        db,
+        "SELECT id FROM pr_links WHERE run_id = ? AND task_id = ?",
+        input.runID,
+        input.taskID,
+      );
+      if (existing != null) {
+        db.prepare(
+          "UPDATE pr_links SET pr_url = ?, pr_number = ?, last_synced_at = ? WHERE id = ?",
+        ).run(input.prURL, input.prNumber, lastSyncedAt, existing.id);
+      } else {
+        db.prepare(
+          `INSERT INTO pr_links(id, run_id, task_id, pr_url, pr_number, last_synced_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        ).run(randomUUID(), input.runID, input.taskID, input.prURL, input.prNumber, lastSyncedAt);
+      }
+      const saved = oneRow(
+        db,
+        "SELECT * FROM pr_links WHERE run_id = ? AND task_id = ?",
+        input.runID,
+        input.taskID,
+      );
+      return DatabaseMappers.prLink(saved as Row);
+    }, [input.runID]);
+  }
+
+  async getPrLink(runID: string, taskID: string): Promise<PrLink | null> {
+    const row = oneRow(
+      this.db,
+      "SELECT * FROM pr_links WHERE run_id = ? AND task_id = ?",
+      runID,
+      taskID,
+    );
+    return row == null ? null : DatabaseMappers.prLink(row);
+  }
+
+  async saveRunGateSnapshot(runID: string, snapshotJson: string): Promise<void> {
+    this.write((db) => {
+      requireRunSync(db, runID);
+      // Written once when the run starts; frozen for the run's lifetime.
+      db.prepare(
+        "UPDATE team_runs SET gate_snapshot_json = ?, revision = revision + 1, updated_at = ? WHERE id = ?",
+      ).run(snapshotJson, nowSeconds(), runID);
+    }, [runID]);
+  }
+
   async importLegacySnapshot(data: Buffer, sourceURL: string): Promise<TeamRunSnapshot | null> {
     return this.write((db) => {
       const imported = oneRow(
@@ -1282,6 +1750,20 @@ function requireTaskSync(db: SqliteDatabase, id: string, runID: string): ChildTa
   const row = oneRow(db, "SELECT * FROM child_tasks WHERE id = ? AND run_id = ?", id, runID);
   if (row == null) throw DomainError.taskNotFound(id);
   return DatabaseMappers.task(row);
+}
+
+function reviewCommentSync(db: SqliteDatabase, runID: string, commentID: string): ReviewComment {
+  const row = oneRow(db, "SELECT * FROM review_comments WHERE id = ? AND run_id = ?", commentID, runID);
+  if (row == null) throw DomainError.invalidTask(`Review comment not found: ${commentID}`);
+  return DatabaseMappers.reviewComment(row);
+}
+
+function gateItemsSync(db: SqliteDatabase, evaluationID: string): GateEvaluationItem[] {
+  return allRows(
+    db,
+    "SELECT * FROM gate_evaluation_items WHERE evaluation_id = ? ORDER BY rowid",
+    evaluationID,
+  ).map(DatabaseMappers.gateEvaluationItem);
 }
 
 function loadTasksSync(db: SqliteDatabase, runID: string): ChildTask[] {

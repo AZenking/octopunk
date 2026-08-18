@@ -28,13 +28,14 @@ const startInput = (requestID: string, sessionID = "session-a") => ({
 describe("migrations", () => {
   it("applies all stages up to the current version", () => {
     const db = OctoPunkDatabase.inMemory();
-    expect(OctoPunkDatabaseMigrator.readVersion(db.writer)).toBe(9);
+    expect(OctoPunkDatabaseMigrator.readVersion(db.writer)).toBe(10);
     const teamRunsColumns = (
       db.writer.prepare("PRAGMA table_info(team_runs)").all() as { name: string }[]
     ).map((row) => row.name);
     expect(teamRunsColumns).toContain("hidden_at");
     expect(teamRunsColumns).toContain("archived_at");
     expect(teamRunsColumns).toContain("session_id");
+    expect(teamRunsColumns).toContain("gate_snapshot_json");
     const childTasksColumns = (
       db.writer.prepare("PRAGMA table_info(child_tasks)").all() as { name: string }[]
     ).map((row) => row.name);
@@ -57,6 +58,14 @@ describe("migrations", () => {
       "relay_events",
       "idempotency_requests",
       "app_metadata",
+      // v10: review center & quality gates.
+      "review_comments",
+      "project_gate_configs",
+      "gate_evaluations",
+      "gate_evaluation_items",
+      "arbitrations",
+      "delivery_summaries",
+      "pr_links",
     ]) {
       expect(tables).toContain(expected);
     }
@@ -540,5 +549,344 @@ describe("repository lifecycle", () => {
     await Promise.allSettled([pumpSummary, pumpTail]);
     expect(seenSummaries).toContain(1);
     expect(Math.max(...seenTailCounts)).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// ---- v0.4 review center & quality gates (specs/002-v04-review-center-gates) ----
+
+async function makeRunWithTask(
+  repository: SqliteTeamRunRepository,
+  requestPrefix: string,
+): Promise<{ runID: string; taskID: string }> {
+  const start = await repository.startTeam(startInput(`${requestPrefix}-start`));
+  const batch = await repository.delegateTasks({
+    requestID: `${requestPrefix}-delegate`,
+    runID: start.run.id,
+    contextSummary: "",
+    tasks: [
+      {
+        clientKey: "work",
+        title: "Work",
+        prompt: "Work",
+        agentKind: "codex",
+        model: null,
+        executionMode: "workspace_write",
+        parentTask: null,
+        dependencies: [],
+      },
+    ],
+  });
+  return { runID: start.run.id, taskID: batch.tasks[0].id };
+}
+
+describe("review center comments", () => {
+  it("batch-inserts comments atomically with idempotent replay", async () => {
+    const { repository } = makeRepository();
+    const { runID, taskID } = await makeRunWithTask(repository, "rc");
+    const comments = [
+      {
+        filePath: "src/a.ts",
+        lineStart: 10,
+        contextSnapshot: "const a = 1;",
+        body: "Rename this",
+        severity: "info" as const,
+        author: "user" as const,
+      },
+      {
+        filePath: "src/b.ts",
+        lineStart: 20,
+        lineEnd: 24,
+        contextSnapshot: "export function b() {}",
+        body: "Missing null check",
+        severity: "risk" as const,
+        author: "codex" as const,
+      },
+    ];
+    const created = await repository.addReviewComments({
+      requestID: "rc-c1",
+      runID,
+      taskID,
+      comments,
+    });
+    expect(created).toHaveLength(2);
+    expect(created[0].status).toBe("open");
+    expect(created[0].lineEnd).toBe(10);
+    expect(created[1].lineEnd).toBe(24);
+
+    // Replaying the same requestID returns the cached batch, not duplicates.
+    const replay = await repository.addReviewComments({ requestID: "rc-c1", runID, taskID, comments });
+    expect(stableStringify(replay)).toBe(stableStringify(created));
+
+    const listed = await repository.listReviewComments(runID, taskID);
+    expect(listed.map((comment) => comment.id).sort()).toEqual(created.map((comment) => comment.id).sort());
+
+    // Open list surfaces risk severity first (spec: risk findings stay on top).
+    const open = await repository.listOpenReviewComments(runID);
+    expect(open.map((comment) => comment.severity)).toEqual(["risk", "info"]);
+
+    const snapshot = await repository.snapshot(runID);
+    expect(snapshot.events.some((event) => event.kind === "review.comment_added")).toBe(true);
+  });
+
+  it("moves open comments to terminal states and rejects illegal transitions", async () => {
+    const { repository } = makeRepository();
+    const { runID, taskID } = await makeRunWithTask(repository, "rs");
+    const created = await repository.addReviewComments({
+      requestID: "rs-c1",
+      runID,
+      taskID,
+      comments: [
+        {
+          filePath: "src/a.ts",
+          lineStart: 1,
+          contextSnapshot: "line",
+          body: "One",
+          severity: "info",
+          author: "user",
+        },
+        {
+          filePath: "src/b.ts",
+          lineStart: 2,
+          contextSnapshot: "line",
+          body: "Two",
+          severity: "risk",
+          author: "codex",
+        },
+      ],
+    });
+    const [first, second] = created;
+
+    const resolved = await repository.setReviewCommentStatus({
+      requestID: "rs-s1",
+      runID,
+      commentID: first.id,
+      status: "resolved",
+    });
+    expect(resolved.status).toBe("resolved");
+    // Idempotent replay returns the cached terminal state.
+    const replay = await repository.setReviewCommentStatus({
+      requestID: "rs-s1",
+      runID,
+      commentID: first.id,
+      status: "resolved",
+    });
+    expect(stableStringify(replay)).toBe(stableStringify(resolved));
+
+    const moved = await repository.setReviewCommentStatus({
+      requestID: "rs-s2",
+      runID,
+      commentID: second.id,
+      status: "line_changed",
+    });
+    expect(moved.status).toBe("line_changed");
+
+    // Terminal states are irreversible.
+    await expect(
+      repository.setReviewCommentStatus({ requestID: "rs-s3", runID, commentID: first.id, status: "dismissed" }),
+    ).rejects.toMatchObject({ kind: "invalidTransition" });
+    await expect(
+      repository.setReviewCommentStatus({ requestID: "rs-s4", runID, commentID: second.id, status: "resolved" }),
+    ).rejects.toThrow(DomainError);
+
+    expect(await repository.listOpenReviewComments(runID)).toHaveLength(0);
+    const snapshot = await repository.snapshot(runID);
+    const transitions = snapshot.events.filter((event) => event.kind === "review.comment_status_changed");
+    expect(transitions).toHaveLength(2);
+  });
+});
+
+describe("quality gates", () => {
+  it("upserts the per-project gate config", async () => {
+    const { repository } = makeRepository();
+    expect(await repository.getGateConfig("/tmp/repo")).toBeNull();
+    await repository.saveGateConfig({
+      repositoryPath: "/tmp/repo",
+      configJson: '{"reviewMode":"standard"}',
+      updatedAt: 100,
+    });
+    const initial = await repository.getGateConfig("/tmp/repo");
+    expect(initial?.configJson).toBe('{"reviewMode":"standard"}');
+    expect(initial?.updatedAt).toBe(100);
+
+    await repository.saveGateConfig({
+      repositoryPath: "/tmp/repo",
+      configJson: '{"reviewMode":"arbitration"}',
+      updatedAt: 200,
+    });
+    const updated = await repository.getGateConfig("/tmp/repo");
+    expect(updated?.configJson).toBe('{"reviewMode":"arbitration"}');
+    expect(updated?.updatedAt).toBe(200);
+
+    // Other projects keep independent configs.
+    await repository.saveGateConfig({
+      repositoryPath: "/tmp/other",
+      configJson: '{"reviewMode":"contest"}',
+      updatedAt: 300,
+    });
+    expect((await repository.getGateConfig("/tmp/other"))?.configJson).toContain("contest");
+    expect((await repository.getGateConfig("/tmp/repo"))?.updatedAt).toBe(200);
+  });
+
+  it("records gate evaluations with idempotent replay and waives items with a trail", async () => {
+    const { repository, db } = makeRepository();
+    const { runID, taskID } = await makeRunWithTask(repository, "ge");
+    const items = [
+      { checkKey: "tests" as const, status: "pass" as const, detail: "vitest 12/12" },
+      {
+        checkKey: "lint" as const,
+        status: "fail" as const,
+        detail: "1 error",
+        fixSuggestion: "pnpm lint --fix",
+      },
+    ];
+    const evaluation = await repository.recordGateEvaluation({
+      requestID: "ge-1",
+      runID,
+      taskID,
+      overall: "fail",
+      items,
+    });
+    expect(evaluation.overall).toBe("fail");
+    expect(evaluation.items).toHaveLength(2);
+    expect(evaluation.items[1].fixSuggestion).toBe("pnpm lint --fix");
+    expect(evaluation.items[1].waivedBy).toBeNull();
+
+    // Same requestID → cached evaluation, no second row.
+    const replay = await repository.recordGateEvaluation({
+      requestID: "ge-1",
+      runID,
+      taskID,
+      overall: "fail",
+      items,
+    });
+    expect(stableStringify(replay)).toBe(stableStringify(evaluation));
+    const counted = db.writer
+      .prepare("SELECT COUNT(*) AS n FROM gate_evaluations WHERE run_id = ?")
+      .get(runID) as { n: number };
+    expect(counted.n).toBe(1);
+
+    const latest = await repository.getLatestGateEvaluation(runID, taskID);
+    expect(latest?.id).toBe(evaluation.id);
+    expect(latest?.items.map((item) => item.checkKey)).toEqual(["tests", "lint"]);
+
+    // Waive the failing item: status flips and the trail records who/why/when.
+    const failing = latest?.items.find((item) => item.status === "fail");
+    expect(failing).toBeDefined();
+    const waived = await repository.waiveGateItem({
+      requestID: "ge-w1",
+      evaluationID: evaluation.id,
+      itemID: (failing as { id: string }).id,
+      waivedBy: "user",
+      waivedReason: "Legacy lint baseline",
+    });
+    expect(waived.status).toBe("waived");
+    expect(waived.waivedBy).toBe("user");
+    expect(waived.waivedReason).toBe("Legacy lint baseline");
+    expect(waived.waivedAt).not.toBeNull();
+    const reread = (await repository.listGateEvaluationItems(evaluation.id)).find(
+      (item) => item.id === waived.id,
+    );
+    expect(reread?.status).toBe("waived");
+    expect(reread?.waivedReason).toBe("Legacy lint baseline");
+
+    const snapshot = await repository.snapshot(runID);
+    expect(snapshot.events.some((event) => event.kind === "gate.evaluated")).toBe(true);
+    expect(snapshot.events.some((event) => event.kind === "gate.item_waived")).toBe(true);
+
+    // A later evaluation supersedes the first as the latest one.
+    const second = await repository.recordGateEvaluation({
+      requestID: "ge-2",
+      runID,
+      taskID,
+      overall: "pass",
+      items: [{ checkKey: "tests", status: "pass", detail: "vitest 13/13" }],
+    });
+    expect((await repository.getLatestGateEvaluation(runID, taskID))?.id).toBe(second.id);
+  });
+});
+
+describe("arbitration, summaries and PR links", () => {
+  it("records and reloads arbitration outcomes", async () => {
+    const { repository } = makeRepository();
+    const { runID, taskID } = await makeRunWithTask(repository, "ar");
+    expect(await repository.getArbitration(runID, taskID)).toBeNull();
+    const recorded = await repository.recordArbitration({
+      runID,
+      taskID,
+      consensus: "Ship after follow-up",
+      disagreements: [{ reviewer: "codex", verdict: "REWORK", evidence: "missing test for b()" }],
+      toVerify: [{ claim: "vitest is green", howToVerify: "pnpm test" }],
+      autoPassed: false,
+    });
+    expect(recorded.autoPassed).toBe(false);
+    const loaded = await repository.getArbitration(runID, taskID);
+    expect(loaded?.id).toBe(recorded.id);
+    expect(loaded?.consensus).toBe("Ship after follow-up");
+    expect(loaded?.disagreements).toEqual(recorded.disagreements);
+    expect(loaded?.toVerify[0]?.claim).toBe("vitest is green");
+    const snapshot = await repository.snapshot(runID);
+    expect(snapshot.events.some((event) => event.kind === "arbitration.recorded")).toBe(true);
+  });
+
+  it("records task-level and run-level delivery summaries", async () => {
+    const { repository } = makeRepository();
+    const { runID, taskID } = await makeRunWithTask(repository, "ds");
+    expect(await repository.getDeliverySummary(runID, null)).toBeNull();
+    const taskSummary = await repository.recordDeliverySummary({
+      runID,
+      taskID,
+      verdict: "PASS",
+      summaryMd: "# Task summary",
+      evidence: ["report-1", "gate-1"],
+    });
+    expect(taskSummary.taskID).toBe(taskID);
+    const runSummary = await repository.recordDeliverySummary({
+      runID,
+      taskID: null,
+      verdict: "PASS",
+      summaryMd: "# Run summary",
+      evidence: [],
+    });
+    expect(runSummary.taskID).toBeNull();
+
+    expect((await repository.getDeliverySummary(runID, taskID))?.evidence).toEqual(["report-1", "gate-1"]);
+    expect((await repository.getDeliverySummary(runID, null))?.summaryMD).toBe("# Run summary");
+    const snapshot = await repository.snapshot(runID);
+    expect(snapshot.events.filter((event) => event.kind === "summary.generated")).toHaveLength(2);
+  });
+
+  it("upserts the PR link and freezes the run gate snapshot", async () => {
+    const { repository, db } = makeRepository();
+    const { runID, taskID } = await makeRunWithTask(repository, "pr");
+    expect(await repository.getPrLink(runID, taskID)).toBeNull();
+
+    await repository.savePrLink({
+      runID,
+      taskID,
+      prURL: "https://github.com/org/repo/pull/1",
+      prNumber: 1,
+      lastSyncedAt: 100,
+    });
+    const updated = await repository.savePrLink({
+      runID,
+      taskID,
+      prURL: "https://github.com/org/repo/pull/2",
+      prNumber: 2,
+      lastSyncedAt: 200,
+    });
+    expect(updated.prNumber).toBe(2);
+    expect(updated.prURL).toContain("/pull/2");
+    const counted = db.writer
+      .prepare("SELECT COUNT(*) AS n FROM pr_links WHERE run_id = ? AND task_id = ?")
+      .get(runID, taskID) as { n: number };
+    expect(counted.n).toBe(1);
+    const loaded = await repository.getPrLink(runID, taskID);
+    expect(loaded?.lastSyncedAt).toBe(200);
+
+    await repository.saveRunGateSnapshot(runID, '{"reviewMode":"standard","maxRiskFindings":0}');
+    const row = db.writer
+      .prepare("SELECT gate_snapshot_json AS json FROM team_runs WHERE id = ?")
+      .get(runID) as { json: string | null };
+    expect(row.json).toBe('{"reviewMode":"standard","maxRiskFindings":0}');
   });
 });

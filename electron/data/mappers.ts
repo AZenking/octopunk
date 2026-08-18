@@ -2,10 +2,18 @@
 
 import type { SqliteDatabase } from "./database";
 import type {
+  Arbitration,
+  ArbitrationDisagreement,
+  ArbitrationToVerify,
   ChildAgentKind,
   ChildTask,
   ChildTaskStatus,
+  DeliverySummary,
   RelayEvent,
+  ReviewComment,
+  ReviewCommentAuthor,
+  ReviewCommentSeverity,
+  ReviewCommentStatus,
   ReviewCycle,
   ReviewFinding,
   ReviewFindingSeverity,
@@ -21,12 +29,25 @@ import type {
   TeamRun,
   TeamRunStatus,
 } from "../domain/models";
+import type {
+  GateEvaluation,
+  GateEvaluationItem,
+  PrLink,
+} from "../domain/repositoryPort";
 import {
   CHILD_AGENT_KINDS,
   CHILD_TASK_STATUSES,
+  GATE_CHECK_STATUSES,
+  GATE_OVERALLS,
+  makeArbitration,
   makeChildTask,
+  makeDeliverySummary,
+  makeReviewComment,
   makeTaskBatch,
   makeTeamRun,
+  REVIEW_COMMENT_AUTHORS,
+  REVIEW_COMMENT_SEVERITIES,
+  REVIEW_COMMENT_STATUSES,
   REVIEW_FINDING_SEVERITIES,
   REVIEW_VERDICTS,
   TASK_EXECUTION_MODES,
@@ -216,6 +237,103 @@ export const DatabaseMappers = {
       updatedAt: date(row, "updated_at"),
     };
   },
+
+  // ---- v0.4 review center & quality gates (specs/002-v04-review-center-gates) ----
+
+  reviewComment(row: Row): ReviewComment {
+    return makeReviewComment({
+      id: uuid(row, "id"),
+      runID: uuid(row, "run_id"),
+      taskID: uuid(row, "task_id"),
+      reviewRound: int(row, "review_round"),
+      filePath: row.file_path as string,
+      lineStart: int(row, "line_start"),
+      lineEnd: int(row, "line_end"),
+      contextSnapshot: row.context_snapshot as string,
+      body: row.body as string,
+      severity: parseEnum<ReviewCommentSeverity>(
+        REVIEW_COMMENT_SEVERITIES,
+        row.severity,
+        "info",
+      ),
+      author: parseEnum<ReviewCommentAuthor>(REVIEW_COMMENT_AUTHORS, row.author, "user"),
+      status: parseEnum<ReviewCommentStatus>(REVIEW_COMMENT_STATUSES, row.status, "open"),
+      createdAt: date(row, "created_at"),
+      updatedAt: date(row, "updated_at"),
+    });
+  },
+
+  gateEvaluationItem(row: Row): GateEvaluationItem {
+    return {
+      id: uuid(row, "id"),
+      evaluationID: uuid(row, "evaluation_id"),
+      checkKey: row.check_key as GateEvaluationItem["checkKey"],
+      // Fail-safe parsing: an unrecognized status degrades to non-blocking
+      // `unknown`, exactly like a timed-out check (Doctor principle).
+      status: parseEnum<GateEvaluationItem["status"]>(GATE_CHECK_STATUSES, row.status, "unknown"),
+      detail: row.detail as string,
+      fixSuggestion: optionalString(row, "fix_suggestion"),
+      waivedBy: optionalString(row, "waived_by"),
+      waivedReason: optionalString(row, "waived_reason"),
+      waivedAt: optionalDate(row, "waived_at"),
+    };
+  },
+
+  gateEvaluation(row: Row, items: GateEvaluationItem[]): GateEvaluation {
+    return {
+      id: uuid(row, "id"),
+      runID: uuid(row, "run_id"),
+      taskID: uuid(row, "task_id"),
+      requestID: row.request_id as string,
+      // Fail-closed: an unrecognized overall must never read as a pass.
+      overall: parseEnum<GateEvaluation["overall"]>(GATE_OVERALLS, row.overall, "fail"),
+      evaluatedAt: date(row, "evaluated_at"),
+      items,
+    };
+  },
+
+  arbitration(row: Row): Arbitration {
+    return makeArbitration({
+      id: uuid(row, "id"),
+      runID: uuid(row, "run_id"),
+      taskID: uuid(row, "task_id"),
+      consensus: row.consensus as string,
+      disagreements: decodeJsonArray<ArbitrationDisagreement>(row.disagreements_json),
+      toVerify: decodeJsonArray<ArbitrationToVerify>(row.to_verify_json),
+      autoPassed: int(row, "auto_passed") === 1,
+      createdAt: date(row, "created_at"),
+    });
+  },
+
+  deliverySummary(row: Row, evidence: string[]): DeliverySummary {
+    return makeDeliverySummary({
+      id: uuid(row, "id"),
+      runID: uuid(row, "run_id"),
+      taskID: optionalUUID(row, "task_id"),
+      verdict: parseEnum<ReviewVerdict>(REVIEW_VERDICTS, row.verdict, "BLOCKED"),
+      summaryMD: row.summary_md as string,
+      evidence,
+      createdAt: date(row, "created_at"),
+    });
+  },
+
+  prLink(row: Row): PrLink {
+    return {
+      id: uuid(row, "id"),
+      runID: uuid(row, "run_id"),
+      taskID: uuid(row, "task_id"),
+      prURL: row.pr_url as string,
+      prNumber: int(row, "pr_number"),
+      lastSyncedAt: date(row, "last_synced_at"),
+    };
+  },
+
+  gateConfig(row: Row): { configJson: string; updatedAt: number } {
+    return {
+      configJson: row.config_json as string,
+      updatedAt: date(row, "updated_at"),
+    };
+  },
 };
 
 /** Row helpers shared with the repository. */
@@ -238,5 +356,16 @@ export function parseStringArray(encoded: unknown): string[] | null {
       : null;
   } catch {
     return null;
+  }
+}
+
+/** Decodes a JSON column that stores an array of objects; malformed data degrades to []. */
+function decodeJsonArray<T>(encoded: unknown): T[] {
+  if (typeof encoded !== "string" || encoded.length === 0) return [];
+  try {
+    const parsed = JSON.parse(encoded);
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch {
+    return [];
   }
 }

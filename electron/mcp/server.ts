@@ -13,7 +13,8 @@ import {
 import type { AgentTeamServicePortLike } from "./serviceTypes";
 import type { ContextFetchService } from "../application/contextFetchService";
 import { DEFAULT_MAX_CONCURRENT_TASKS } from "../../shared/ipc";
-import type { GitPort, KeychainPort } from "../application/ports";
+import type { GitDiffSide, GitPort, KeychainPort } from "../application/ports";
+import type { ReviewCenterService, ReviewCommentInput } from "../application/reviewCenterService";
 import { TaskEventHub } from "../domain/events";
 import type { TaskEventUpdate } from "../domain/events";
 import { OctoPunkContextServer } from "../application/ports";
@@ -61,8 +62,13 @@ export class OctoPunkMCPServer {
     readOnlyContext?: ContextFetchService | null;
     /** Stored OctoPunk.maxConcurrentTasks, used when a caller omits the argument. */
     defaultMaxConcurrentTasks?: () => number;
+    /** Review Center service; when present the review tools become available. */
+    reviewCenter?: ReviewCenterService | null;
   }) {
-    this.service = input.service;
+    // Prototype-chain delegation keeps reads live against the underlying
+    // service instance while exposing the optional reviewCenter field.
+    this.service = Object.create(input.service) as AgentTeamServicePortLike;
+    this.service.reviewCenter = input.reviewCenter ?? undefined;
     this.git = input.git;
     this.keychain = input.keychain;
     this.eventHub = input.eventHub ?? null;
@@ -305,6 +311,22 @@ function delegateTasksSchema(): Record<string, unknown> {
     },
   };
 }
+function reviewCommentsSchema(): Record<string, unknown> {
+  return {
+    type: "array",
+    items: {
+      type: "object",
+      properties: {
+        file: stringSchema(),
+        line_start: integerSchema(),
+        line_end: integerSchema(),
+        body: stringSchema(),
+        severity: stringSchema(),
+      },
+      required: ["file", "line_start", "body"],
+    },
+  };
+}
 
 function tool(
   name: string,
@@ -392,7 +414,7 @@ export function fullToolList(): Tool[] {
     ),
     tool(
       "get_task_review_context",
-      `Read the task report and audit context for Codex review. ${runIDNote}`,
+      `Read the task report, audit context, unresolved review findings, and delivery summary (when present) for review. ${runIDNote}`,
       { run_id: stringSchema(), task_id: stringSchema() },
       ["task_id"],
     ),
@@ -407,6 +429,41 @@ export function fullToolList(): Tool[] {
         findings: findingsSchema(),
       },
       ["request_id", "task_id", "summary"],
+    ),
+    tool(
+      "get_task_diff",
+      `Read a task's changed-file tree and, when path names one changed file, its hunk-paged diff text (<=64KiB redacted per page, page.next_cursor continues). ${runIDNote}`,
+      {
+        run_id: stringSchema(),
+        task_id: stringSchema(),
+        side: stringSchema(),
+        path: stringSchema(),
+        cursor: stringSchema(),
+      },
+      ["task_id", "side"],
+    ),
+    tool(
+      "add_review_comments",
+      `Attach batched line-anchored review comments (baseline-side anchors; each file must appear in the task's worktree-side diff). ${runIDNote}`,
+      {
+        request_id: stringSchema(),
+        run_id: stringSchema(),
+        task_id: stringSchema(),
+        comments: reviewCommentsSchema(),
+      },
+      ["request_id", "task_id", "comments"],
+    ),
+    tool(
+      "request_rework_batch",
+      `Aggregate selected open review comments into one rework round through the task's existing review flow. ${runIDNote}`,
+      {
+        request_id: stringSchema(),
+        run_id: stringSchema(),
+        task_id: stringSchema(),
+        comment_ids: arraySchema(),
+        summary: stringSchema(),
+      },
+      ["request_id", "task_id", "comment_ids", "summary"],
     ),
     tool(
       "accept_task",
@@ -698,11 +755,17 @@ async function dispatchTool(
       return stableStringify(result);
     }
     case "get_task_review_context": {
-      const result = await service.getTaskReviewContext(
-        await resolveRunID(service, arguments_, sessionID),
-        requireUUID(arguments_, "task_id"),
-      );
-      return stableStringify(result);
+      const runID = await resolveRunID(service, arguments_, sessionID);
+      const taskID = requireUUID(arguments_, "task_id");
+      const context = await service.getTaskReviewContext(runID, taskID);
+      // Spec 002 section B: append unresolved findings (open comment digests)
+      // and the delivery summary when the Review Center service is wired.
+      if (service.reviewCenter == null) {
+        return stableStringify(context);
+      }
+      const unresolvedFindings = await service.reviewCenter.unresolvedFindings(runID, taskID);
+      const deliverySummary = await service.reviewCenter.getDeliverySummary(runID, taskID);
+      return stableStringify({ ...context, unresolvedFindings, deliverySummary });
     }
     case "get_task_execution_log": {
       const result = await service.getTaskExecutionLog(
@@ -732,6 +795,44 @@ async function dispatchTool(
         return stableStringify(await service.acceptTask(input));
       }
       return stableStringify(await service.blockTask(input));
+    }
+    case "get_task_diff": {
+      const review = requireReviewCenter(service);
+      const side = diffSide(arguments_);
+      const runID = await resolveRunID(service, arguments_, sessionID);
+      const taskID = requireUUID(arguments_, "task_id");
+      const path = optionalString(arguments_, "path");
+      const page =
+        path == null
+          ? null
+          : await review.getDiffPage(runID, taskID, side, path, optionalString(arguments_, "cursor") ?? null);
+      const tree = await review.getDiffTree(runID, taskID, side);
+      return stableStringify({ tree, page });
+    }
+    case "add_review_comments": {
+      const review = requireReviewCenter(service);
+      const result = await review.addComments({
+        requestID: requireString(arguments_, "request_id"),
+        runID: await resolveRunID(service, arguments_, sessionID),
+        taskID: requireUUID(arguments_, "task_id"),
+        comments: commentInputs(arguments_.comments),
+      });
+      return stableStringify(result);
+    }
+    case "request_rework_batch": {
+      const review = requireReviewCenter(service);
+      const commentIDs = uuidArray(arguments_, "comment_ids");
+      if (commentIDs.length === 0) {
+        throw new InvalidParamsError("comment_ids must contain at least one comment id.");
+      }
+      const result = await review.reworkBatch({
+        requestID: requireString(arguments_, "request_id"),
+        runID: await resolveRunID(service, arguments_, sessionID),
+        taskID: requireUUID(arguments_, "task_id"),
+        commentIDs,
+        summary: requireString(arguments_, "summary"),
+      });
+      return stableStringify(result);
     }
     case "resume_task": {
       const result = await service.resumeTask({
@@ -922,6 +1023,55 @@ function findings(value: unknown): ReviewFinding[] {
 
 function isUUID(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+/** Review Center tools share the team service port; until appEnvironment wires the instance they answer with a readable error. */
+function requireReviewCenter(service: AgentTeamServicePortLike): ReviewCenterService {
+  if (service.reviewCenter == null) {
+    throw new Error("Review Center tools are unavailable: the reviewCenter service is not wired in this build.");
+  }
+  return service.reviewCenter;
+}
+
+function diffSide(arguments_: Arguments): GitDiffSide {
+  const side = requireString(arguments_, "side");
+  if (side !== "baseline" && side !== "worktree" && side !== "integration") {
+    throw new InvalidParamsError("Unsupported side. Use baseline, worktree, or integration.");
+  }
+  return side;
+}
+
+/** snake_case tool comments → ReviewCommentInput; semantic anchor validation stays in the service. */
+function commentInputs(value: unknown): ReviewCommentInput[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new InvalidParamsError("comments must contain at least one comment object");
+  }
+  return value.map((item) => {
+    if (typeof item !== "object" || item == null || Array.isArray(item)) {
+      throw new InvalidParamsError("Each comment must be an object");
+    }
+    const object = item as Arguments;
+    const lineStart = object.line_start;
+    if (typeof lineStart !== "number" || !Number.isInteger(lineStart)) {
+      throw new InvalidParamsError("Comment line_start must be an integer");
+    }
+    const rawLineEnd = object.line_end;
+    if (rawLineEnd != null && (typeof rawLineEnd !== "number" || !Number.isInteger(rawLineEnd))) {
+      throw new InvalidParamsError("Comment line_end must be an integer when present");
+    }
+    const rawSeverity = object.severity;
+    const severity = typeof rawSeverity === "string" ? rawSeverity : undefined;
+    if (severity != null && severity !== "info" && severity !== "risk") {
+      throw new InvalidParamsError("Unsupported comment severity. Use info or risk.");
+    }
+    return {
+      file: requiredObjectString(object, "file"),
+      lineStart,
+      lineEnd: rawLineEnd ?? undefined,
+      body: requiredObjectString(object, "body"),
+      severity,
+    };
+  });
 }
 
 export { randomUUID };

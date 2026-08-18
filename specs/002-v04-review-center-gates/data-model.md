@@ -1,6 +1,6 @@
 # Data Model: v0.4 Review Center 与质量门禁(Phase 1)
 
-> 迁移版本:SQLite migrator v6 → **v7**(以下新表/新列)。命名与列风格
+> 迁移版本:SQLite migrator v9 → **v10**(实现时代价发现 v7/v8 已被 archived_at/session_id 占用,本特性顺延注册为 v10)。命名与列风格
 > 沿用既有 DDL(snake_case、revision 乐观锁、created_at/updated_at 秒级时间戳)。
 
 ## 新增实体

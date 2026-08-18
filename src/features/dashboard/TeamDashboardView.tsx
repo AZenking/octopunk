@@ -23,6 +23,7 @@ import { runStatusToAgent } from "@/lib/agentView";
 import { SettingsView } from "@/features/settings/SettingsView";
 import { StartForm } from "@/features/dashboard/StartForm";
 import { BatchDelegatePanel } from "@/features/dashboard/BatchDelegatePanel";
+import { ReviewCenterView } from "@/features/reviewCenter/ReviewCenterView";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -37,7 +38,7 @@ import { SidebarProvider } from "@/components/ui/sidebar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
-type Page = "run" | "new-run" | "delegate" | "settings";
+type Page = "run" | "new-run" | "delegate" | "settings" | "review-center";
 
 const TOOLBAR_BUTTON =
   "border-border text-muted-foreground hover:bg-muted hover:text-foreground app-no-drag flex size-7 cursor-pointer items-center justify-center rounded-md border transition-colors";
@@ -188,6 +189,8 @@ export function TeamDashboardView() {
               appState.setSelectedRunID(null);
               setPage("new-run");
             }}
+            onOpenReviewCenter={() => setPage("review-center")}
+            reviewActive={page === "review-center"}
             onOpenSettings={() => setPage("settings")}
             onCancelRun={(run) => setRunPendingCancellation(run)}
             onDeleteRun={(run) => setRunPendingDiscard(run)}
@@ -200,6 +203,8 @@ export function TeamDashboardView() {
           <div className="flex-1 overflow-y-auto">
             <SettingsView section={settingsSection} />
           </div>
+        ) : page === "review-center" ? (
+          <ReviewCenterView />
         ) : page === "new-run" || runID == null ? (
           <div className="flex-1 overflow-y-auto">
             <StartForm onStarted={() => setPage("run")} />

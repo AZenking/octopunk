@@ -1,6 +1,7 @@
 // Port of OctoPunk/OctoPunk/Application/Ports/AgentPorts.swift.
 
 import type { ChildAgentKind, TaskExecutionMode, TaskWorkspaceKind } from "../domain/models";
+import type { DiffPageDTO, DiffTreeEntryDTO } from "../../shared/dtos";
 
 export type { ChildAgentKind, TaskExecutionMode, TaskWorkspaceKind };
 
@@ -241,6 +242,9 @@ export type GitIntegrationResult =
 
 export type WorkspaceCleanupMode = "deleteBranch" | "discard";
 
+/** Three-way diff viewpoint: baseline commit, task branch HEAD, integration worktree HEAD. */
+export type GitDiffSide = "baseline" | "worktree" | "integration";
+
 export class GitAdapterError extends Error {
   constructor(message: string) {
     super(message);
@@ -270,6 +274,14 @@ export class GitAdapterError extends Error {
     return new GitAdapterError(
       `The repository has no commits yet (${path}). Create an initial commit first — a TeamRun anchors its baseline on HEAD. 仓库还没有任何提交，请先完成一次初始提交再启动 TeamRun。`,
     );
+  }
+  static integrationWorktreeMissing(runID: string): GitAdapterError {
+    return new GitAdapterError(
+      `该运行的集成工作区尚未创建（octopunk/${runID}/integration）。请先执行任务集成或冲突预览，再查看 integration 侧 Diff。`,
+    );
+  }
+  static invalidDiffCursor(cursor: string): GitAdapterError {
+    return new GitAdapterError(`无法解析的 Diff 分页游标（${cursor}）。请从首页重新加载该文件的 Diff。`);
   }
 }
 
@@ -308,6 +320,48 @@ export interface GitPort {
     targetBranch: string;
     baselineCommit: string;
   }): Promise<string>;
+  /**
+   * Change tree (numstat + name-status) for one side of the three-way diff.
+   * The baseline side always compares the baseline commit against itself, so
+   * an empty result is the legal answer. The integration side requires the
+   * integration worktree to exist and throws a readable error otherwise.
+   */
+  diffTree(input: {
+    repositoryURL: string;
+    runID: string;
+    taskID: string;
+    baselineCommit: string;
+    taskBranch: string;
+    side: GitDiffSide;
+  }): Promise<DiffTreeEntryDTO[]>;
+  /**
+   * One page (≤64KiB of redacted text) of the unified diff (-U3) for a single
+   * file; `cursor` continues where the previous page stopped (`null` starts
+   * over) and `nextCursor === null` marks the final page. Binary and oversize
+   * files come back without content hunks.
+   */
+  diffPage(input: {
+    repositoryURL: string;
+    runID: string;
+    taskID: string;
+    baselineCommit: string;
+    taskBranch: string;
+    side: GitDiffSide;
+    path: string;
+    cursor: string | null;
+  }): Promise<DiffPageDTO>;
+  /**
+   * Trial `merge --no-commit --no-ff` of every task branch inside the
+   * integration worktree (creating it at the baseline if needed). Both
+   * conflict and clean outcomes end with `merge --abort` so the worktree
+   * stays untouched; conflicting paths are returned as the file list.
+   */
+  conflictPreview(input: {
+    repositoryURL: string;
+    runID: string;
+    baselineCommit: string;
+    taskBranches: string[];
+  }): Promise<{ conflict: boolean; files: string[] }>;
   cleanupWorkspace(workspace: ChildWorkspace, mode: WorkspaceCleanupMode): Promise<void>;
 }
 

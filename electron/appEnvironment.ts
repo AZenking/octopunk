@@ -24,6 +24,7 @@ import { TaskIntegrationService } from "./application/taskIntegrationService";
 import { AgentTeamApplicationService } from "./application/agentTeamService";
 import { TeamQueryService } from "./application/teamQueryService";
 import { ContextFetchService } from "./application/contextFetchService";
+import { ReviewCenterService } from "./application/reviewCenterService";
 import { TaskEventHub } from "./domain/events";
 import { OctoPunkMCPServer } from "./mcp/server";
 import {
@@ -62,6 +63,7 @@ export class AppEnvironment {
   readonly integration: TaskIntegrationService;
   readonly teamService: AgentTeamApplicationService;
   readonly queryService: TeamQueryService;
+  readonly reviewCenter: ReviewCenterService;
   readonly contextFetch: ContextFetchService;
   readonly eventHub: TaskEventHub;
   readonly keychain: KeychainTokenStore;
@@ -147,6 +149,13 @@ export class AppEnvironment {
       }),
     });
     this.queryService = new TeamQueryService(this.repository);
+    // Review Center shares the same repository/git/teamService instances as the
+    // MCP tools (constitution principle two) — GUI and MCP stay isomorphic.
+    this.reviewCenter = new ReviewCenterService({
+      repository: this.repository,
+      git: this.git,
+      teamService: this.teamService,
+    });
     this.keychain = new KeychainTokenStore();
     this.codexConfig = new FileCodexConfigAdapter();
     this.piConfig = new FilePiConfigAdapter();
@@ -171,6 +180,7 @@ export class AppEnvironment {
       eventHub: this.eventHub,
       readOnlyContext: this.contextFetch,
       defaultMaxConcurrentTasks: () => storedDefaultMaxConcurrentTasks(this.settings),
+      reviewCenter: this.reviewCenter,
     });
   }
 

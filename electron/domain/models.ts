@@ -453,6 +453,210 @@ export function renderTeamContextSummary(summary: RunSummary, now = Date.now() /
   return lines.join("\n");
 }
 
+// ---- v0.4 Review Center & quality gates (specs/002-v04-review-center-gates) ----
+// New-in-v0.4 entities; not part of the Swift port above. Same conventions:
+// string-literal unions with helper tables, epoch-second timestamps, UUID ids.
+
+export const REVIEW_COMMENT_STATUSES = ["open", "resolved", "dismissed", "line_changed"] as const;
+export type ReviewCommentStatus = (typeof REVIEW_COMMENT_STATUSES)[number];
+
+export const REVIEW_COMMENT_SEVERITIES = ["info", "risk"] as const;
+export type ReviewCommentSeverity = (typeof REVIEW_COMMENT_SEVERITIES)[number];
+
+/** Comment authors: the human reviewer plus every supported child-agent kind. */
+export const REVIEW_COMMENT_AUTHORS = ["user", ...CHILD_AGENT_KINDS] as const;
+export type ReviewCommentAuthor = (typeof REVIEW_COMMENT_AUTHORS)[number];
+
+export function reviewCommentStatusIsTerminal(status: ReviewCommentStatus): boolean {
+  return status === "resolved" || status === "dismissed" || status === "line_changed";
+}
+
+/**
+ * Only `open` may transition (→ resolved / dismissed / line_changed); terminal
+ * states are final and irreversible. `line_changed` keeps the anchor snapshot
+ * and reopens the discussion on the moved line (spec edge case: comments must
+ * not be silently lost when rework shifts their anchor).
+ */
+const REVIEW_COMMENT_TRANSITIONS: Record<ReviewCommentStatus, readonly ReviewCommentStatus[]> = {
+  open: ["resolved", "dismissed", "line_changed"],
+  resolved: [],
+  dismissed: [],
+  line_changed: [],
+};
+
+export function canTransitionReviewComment(from: ReviewCommentStatus, to: ReviewCommentStatus): boolean {
+  return REVIEW_COMMENT_TRANSITIONS[from].includes(to);
+}
+
+/** Line-anchored review comment (specs/002 data-model: review_comments). */
+export interface ReviewComment {
+  id: string;
+  runID: string;
+  taskID: string;
+  reviewRound: number;
+  filePath: string;
+  /** Line anchor on the baseline side of the task diff. */
+  lineStart: number;
+  lineEnd: number;
+  /** Anchor-line content snapshot (≤2 KiB) kept when rework shifts the line. */
+  contextSnapshot: string;
+  body: string;
+  severity: ReviewCommentSeverity;
+  author: ReviewCommentAuthor;
+  status: ReviewCommentStatus;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export function makeReviewComment(init: {
+  id?: string;
+  runID: string;
+  taskID: string;
+  reviewRound?: number;
+  filePath: string;
+  lineStart: number;
+  lineEnd?: number;
+  contextSnapshot?: string;
+  body: string;
+  severity?: ReviewCommentSeverity;
+  author?: ReviewCommentAuthor;
+  status?: ReviewCommentStatus;
+  createdAt?: number;
+  updatedAt?: number;
+}): ReviewComment {
+  const now = Date.now() / 1000;
+  return {
+    id: init.id ?? randomUUID(),
+    runID: init.runID,
+    taskID: init.taskID,
+    reviewRound: init.reviewRound ?? 0,
+    filePath: init.filePath,
+    lineStart: init.lineStart,
+    lineEnd: init.lineEnd ?? init.lineStart,
+    contextSnapshot: init.contextSnapshot ?? "",
+    body: init.body,
+    severity: init.severity ?? "info",
+    author: init.author ?? "codex",
+    status: init.status ?? "open",
+    createdAt: init.createdAt ?? now,
+    updatedAt: init.updatedAt ?? now,
+  };
+}
+
+/** Per-check identifiers (specs/002 data-model: gate_evaluation_items.check_key). */
+export const GATE_CHECK_KEYS = [
+  "tests",
+  "lint",
+  "typecheck",
+  "build",
+  "risk_findings",
+  "scope",
+  "dependencies",
+  "target_baseline",
+  "reviewers",
+  "high_risk_confirm",
+  "todo_clean",
+] as const;
+export type GateCheckKey = (typeof GATE_CHECK_KEYS)[number];
+
+/** `unknown` marks timeout/unverifiable checks; it never blocks by itself. */
+export const GATE_CHECK_STATUSES = ["pass", "fail", "waived", "unknown"] as const;
+export type GateCheckStatus = (typeof GATE_CHECK_STATUSES)[number];
+
+export const GATE_OVERALLS = ["pass", "fail", "waived"] as const;
+export type GateOverall = (typeof GATE_OVERALLS)[number];
+
+export const GATE_REVIEW_MODES = [
+  "standard",
+  "cross_model",
+  "dual_readonly",
+  "contest",
+  "role_based",
+  "arbitration",
+] as const;
+export type GateReviewMode = (typeof GATE_REVIEW_MODES)[number];
+
+/** Reviewer disagreement entry stored in arbitrations.disagreements_json. */
+export interface ArbitrationDisagreement {
+  reviewer: string;
+  verdict: ReviewVerdict;
+  evidence: string;
+}
+
+/** Follow-up entry stored in arbitrations.to_verify_json. */
+export interface ArbitrationToVerify {
+  claim: string;
+  howToVerify: string;
+}
+
+/** Arbitration outcome (specs/002 data-model: arbitrations). Pure data. */
+export interface Arbitration {
+  id: string;
+  runID: string;
+  taskID: string;
+  consensus: string;
+  disagreements: ArbitrationDisagreement[];
+  toVerify: ArbitrationToVerify[];
+  /** FR-013: disagreement forbids auto-pass; stays false until resolved. */
+  autoPassed: boolean;
+  createdAt: number;
+}
+
+export function makeArbitration(init: {
+  id?: string;
+  runID: string;
+  taskID: string;
+  consensus?: string;
+  disagreements?: ArbitrationDisagreement[];
+  toVerify?: ArbitrationToVerify[];
+  autoPassed?: boolean;
+  createdAt?: number;
+}): Arbitration {
+  return {
+    id: init.id ?? randomUUID(),
+    runID: init.runID,
+    taskID: init.taskID,
+    consensus: init.consensus ?? "",
+    disagreements: init.disagreements ?? [],
+    toVerify: init.toVerify ?? [],
+    autoPassed: init.autoPassed ?? false,
+    createdAt: init.createdAt ?? Date.now() / 1000,
+  };
+}
+
+/** Delivery summary (specs/002 data-model: delivery_summaries). Pure data. */
+export interface DeliverySummary {
+  id: string;
+  runID: string;
+  /** Null for the run-level final review summary. */
+  taskID: string | null;
+  verdict: ReviewVerdict;
+  summaryMD: string;
+  /** Evidence references (report/log/diff/gate/review ids). */
+  evidence: string[];
+  createdAt: number;
+}
+
+export function makeDeliverySummary(init: {
+  id?: string;
+  runID: string;
+  taskID?: string | null;
+  verdict: ReviewVerdict;
+  summaryMD?: string;
+  evidence?: string[];
+  createdAt?: number;
+}): DeliverySummary {
+  return {
+    id: init.id ?? randomUUID(),
+    runID: init.runID,
+    taskID: init.taskID ?? null,
+    verdict: init.verdict,
+    summaryMD: init.summaryMD ?? "",
+    evidence: init.evidence ?? [],
+    createdAt: init.createdAt ?? Date.now() / 1000,
+  };
+}
+
 /** Domain error carrying the same user-facing messages as the Swift enum. */
 export type DomainErrorKind =
   | "invalidTask"

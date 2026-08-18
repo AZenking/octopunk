@@ -37,6 +37,18 @@ export const TeamEventKind = {
   runArchived: "run.archived",
   /** An archived run was restored to the active sidebar list. */
   runUnarchived: "run.unarchived",
+  /** Batch of line-anchored review comments persisted (specs/002 v0.4 review center). */
+  reviewCommentAdded: "review.comment_added",
+  /** A review comment moved open → resolved/dismissed/line_changed (irreversible, audited). */
+  reviewCommentStatusChanged: "review.comment_status_changed",
+  /** A quality-gate evaluation was recorded for a task. */
+  gateEvaluated: "gate.evaluated",
+  /** A failed gate item was waived with a per-item audit trail (overall recalc is upstream). */
+  gateItemWaived: "gate.item_waived",
+  /** An arbitration outcome (consensus / disagreements / to-verify) was recorded. */
+  arbitrationRecorded: "arbitration.recorded",
+  /** A delivery summary was generated for a task or the whole run. */
+  summaryGenerated: "summary.generated",
 } as const;
 
 export interface TeamEventPayload {
