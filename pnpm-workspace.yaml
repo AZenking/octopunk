@@ -1,0 +1,13 @@
+allowBuilds:
+  # better-sqlite3's own prebuild-install produces a Node-ABI binary that
+  # clobbers the Electron rebuild; the root postinstall (electron-rebuild)
+  # owns the build instead. For vitest under plain Node run:
+  #   pnpm rebuild better-sqlite3
+  # and restore with:
+  #   pnpm exec electron-rebuild -f -w better-sqlite3
+  better-sqlite3: false
+  electron: true
+  esbuild: true
+  "@electron/rebuild": true
+minimumReleaseAgeExclude:
+  - react-resizable-panels@4.12.3
