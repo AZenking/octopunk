@@ -32,6 +32,8 @@ export interface DelegateTaskInput {
   title: string;
   prompt: string;
   agentKind: ChildAgentKind;
+  /** Per-task model override; null/empty falls back to the per-kind setting. */
+  model: string | null;
   executionMode: TaskExecutionMode;
   dependencies: string[];
 }
@@ -50,6 +52,8 @@ export interface DelegateTaskItemInput {
   title: string;
   prompt: string;
   agentKind: ChildAgentKind;
+  /** Per-task model override; null/empty falls back to the per-kind setting. */
+  model: string | null;
   executionMode: TaskExecutionMode;
   parentTask: TaskReference | null;
   dependencies: TaskReference[];

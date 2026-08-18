@@ -6,9 +6,10 @@
 import { useCallback, useState, type ReactNode } from "react";
 import { ArrowLeft } from "lucide-react";
 import type { JoinTasksDTO, RunSummaryDTO } from "../../../shared/dtos";
-import { useAppState } from "@/appState";
+import { useAppState, type ChildAgentKindValue } from "@/appState";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   Select,
@@ -188,7 +189,7 @@ export function BatchDelegatePanel({
             <Row title="子 Agent" desc="由哪个 CLI 执行本批次任务">
               <Select
                 value={appState.childAgentKind}
-                onValueChange={(value) => appState.setChildAgentKind(value as "claude_code" | "codex")}
+                onValueChange={(value) => appState.setChildAgentKind(value as ChildAgentKindValue)}
               >
                 <SelectTrigger className="w-44">
                   <SelectValue />
@@ -200,6 +201,7 @@ export function BatchDelegatePanel({
                   {!appState.disabledAgents.has("codex") && (
                     <SelectItem value="codex">Codex</SelectItem>
                   )}
+                  {!appState.disabledAgents.has("pi") && <SelectItem value="pi">Pi</SelectItem>}
                 </SelectContent>
               </Select>
             </Row>
@@ -218,6 +220,20 @@ export function BatchDelegatePanel({
                   <SelectItem value="workspace_write">工作区写入</SelectItem>
                 </SelectContent>
               </Select>
+            </Row>
+            <Row title="模型（可选）" desc="本批次所有任务生效；留空用全局覆盖">
+              <Input
+                value={appState.childModelOverride}
+                onChange={(event) => appState.setChildModelOverride(event.target.value)}
+                placeholder={
+                  appState.childAgentKind === "claude_code"
+                    ? "如 glm-5.2"
+                    : appState.childAgentKind === "pi"
+                      ? "如 anthropic/claude-sonnet-4-5"
+                      : "如 gpt-5.5-codex"
+                }
+                className="w-52 font-mono text-xs"
+              />
             </Row>
             {availability != null && (
               <div className="flex items-center justify-between gap-6 px-5 py-4">
@@ -251,7 +267,7 @@ export function BatchDelegatePanel({
           </Button>
           <Button
             disabled={
-              appState.disabledAgents.size >= 2 ||
+              appState.disabledAgents.size >= 3 ||
               appState.childBatchDraft.trim().length === 0 ||
               appState.childContextSummary.trim().length === 0 ||
               availability?.isAvailable !== true

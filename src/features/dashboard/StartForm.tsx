@@ -1,7 +1,7 @@
 // New TeamRun page (extracted from the former dashboard start form).
 
 import { FolderGit2, Play, Users } from "lucide-react";
-import { useAppState } from "@/appState";
+import { useAppState, type ChildAgentKindValue } from "@/appState";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -127,7 +127,7 @@ export function StartForm({ onStarted }: { onStarted?: () => void }) {
             <CardDescription>显式 Agent 类型与最小权限执行模式。</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-5">
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-[1fr_180px_180px]">
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-[1fr_160px_150px_180px]">
               <div className="flex flex-col gap-2">
                 <Label htmlFor="child-title">任务标题</Label>
                 <Input
@@ -141,7 +141,7 @@ export function StartForm({ onStarted }: { onStarted?: () => void }) {
                 <Select
                   value={appState.childAgentKind}
                   onValueChange={(value) =>
-                    appState.setChildAgentKind(value as "claude_code" | "codex")
+                    appState.setChildAgentKind(value as ChildAgentKindValue)
                   }
                 >
                   <SelectTrigger className="w-full">
@@ -152,9 +152,10 @@ export function StartForm({ onStarted }: { onStarted?: () => void }) {
                       <SelectItem value="claude_code">Claude Code</SelectItem>
                     )}
                     {!appState.disabledAgents.has("codex") && <SelectItem value="codex">Codex</SelectItem>}
+                    {!appState.disabledAgents.has("pi") && <SelectItem value="pi">Pi</SelectItem>}
                   </SelectContent>
                 </Select>
-                {appState.disabledAgents.size >= 2 && (
+                {appState.disabledAgents.size >= 3 && (
                   <p className="text-muted-foreground text-xs">
                     所有 Agent 均已停用；请在设置的「外部 Agent」中启用后再委派。
                   </p>
@@ -176,6 +177,25 @@ export function StartForm({ onStarted }: { onStarted?: () => void }) {
                     <SelectItem value="workspace_write">工作区写入</SelectItem>
                   </SelectContent>
                 </Select>
+              </div>
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="child-model">模型（可选）</Label>
+                <Input
+                  id="child-model"
+                  value={appState.childModelOverride}
+                  onChange={(event) => appState.setChildModelOverride(event.target.value)}
+                  placeholder={
+                    appState.childAgentKind === "claude_code"
+                      ? "如 glm-5.2；留空用全局"
+                      : appState.childAgentKind === "pi"
+                        ? "如 anthropic/claude-sonnet-4-5"
+                        : "如 gpt-5.5-codex"
+                  }
+                  className="font-mono text-xs"
+                />
+                <p className="text-muted-foreground text-xs">
+                  仅对本任务生效；留空使用设置中的全局模型覆盖。
+                </p>
               </div>
             </div>
             {availability != null && (

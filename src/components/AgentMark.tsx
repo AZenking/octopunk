@@ -2,7 +2,7 @@
 // mode ring tells read-only from workspace-write (not color-only: labels
 // travel with the UI elsewhere).
 
-import { Bot, Terminal } from "lucide-react";
+import { Bot, Sparkles, Terminal } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const MARKS: Record<string, { tile: string; icon: typeof Bot; label: string }> = {
@@ -15,6 +15,11 @@ const MARKS: Record<string, { tile: string; icon: typeof Bot; label: string }> =
     tile: "bg-status-running/10 text-status-running ring-emerald-400/25",
     icon: Terminal,
     label: "Codex",
+  },
+  pi: {
+    tile: "bg-violet-500/10 text-violet-400 ring-violet-400/30",
+    icon: Sparkles,
+    label: "Pi",
   },
 };
 

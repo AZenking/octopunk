@@ -28,13 +28,17 @@ const startInput = (requestID: string, sessionID = "session-a") => ({
 describe("migrations", () => {
   it("applies all stages up to the current version", () => {
     const db = OctoPunkDatabase.inMemory();
-    expect(OctoPunkDatabaseMigrator.readVersion(db.writer)).toBe(8);
+    expect(OctoPunkDatabaseMigrator.readVersion(db.writer)).toBe(9);
     const teamRunsColumns = (
       db.writer.prepare("PRAGMA table_info(team_runs)").all() as { name: string }[]
     ).map((row) => row.name);
     expect(teamRunsColumns).toContain("hidden_at");
     expect(teamRunsColumns).toContain("archived_at");
     expect(teamRunsColumns).toContain("session_id");
+    const childTasksColumns = (
+      db.writer.prepare("PRAGMA table_info(child_tasks)").all() as { name: string }[]
+    ).map((row) => row.name);
+    expect(childTasksColumns).toContain("model");
     const tables = (
       db.writer
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -59,6 +63,77 @@ describe("migrations", () => {
   });
 });
 
+describe("per-task model override", () => {
+  it("persists per-task models and normalizes blank values to null", async () => {
+    const { repository } = makeRepository();
+    const start = await repository.startTeam(startInput("m1"));
+    const batch = await repository.delegateTasks({
+      requestID: "m2",
+      runID: start.run.id,
+      contextSummary: "",
+      tasks: [
+        {
+          clientKey: "a",
+          title: "A",
+          prompt: "A",
+          agentKind: "claude_code",
+          model: "glm-5.2",
+          executionMode: "workspace_write",
+          parentTask: null,
+          dependencies: [],
+        },
+        {
+          clientKey: "b",
+          title: "B",
+          prompt: "B",
+          agentKind: "claude_code",
+          model: "   ",
+          executionMode: "workspace_write",
+          parentTask: null,
+          dependencies: [],
+        },
+      ],
+    });
+    expect(batch.tasks[0].model).toBe("glm-5.2");
+    expect(batch.tasks[1].model).toBeNull();
+
+    const single = await repository.delegateTask({
+      requestID: "m3",
+      runID: start.run.id,
+      title: "C",
+      prompt: "C",
+      agentKind: "claude_code",
+      model: "glm-5-air",
+      executionMode: "read_only",
+      dependencies: [],
+    });
+    expect(single.model).toBe("glm-5-air");
+
+    const snapshot = await repository.snapshot(start.run.id);
+    const models = new Map(snapshot.tasks.map((task) => [task.clientKey, task.model]));
+    expect(models.get("a")).toBe("glm-5.2");
+    expect(models.get("b")).toBeNull();
+    // Single delegation uses the request id as its client key.
+    expect(models.get("m3")).toBe("glm-5-air");
+  });
+
+  it("truncates over-long model ids to 100 characters", async () => {
+    const { repository } = makeRepository();
+    const start = await repository.startTeam(startInput("m4"));
+    const single = await repository.delegateTask({
+      requestID: "m5",
+      runID: start.run.id,
+      title: "D",
+      prompt: "D",
+      agentKind: "codex",
+      model: "x".repeat(140),
+      executionMode: "read_only",
+      dependencies: [],
+    });
+    expect(single.model).toHaveLength(100);
+  });
+});
+
 describe("repository lifecycle", () => {
   it("starts a team, delegates a batch, reports, accepts, and completes", async () => {
     const { repository } = makeRepository();
@@ -76,6 +151,7 @@ describe("repository lifecycle", () => {
           title: "Scan the code",
           prompt: "Scan everything",
           agentKind: "claude_code",
+          model: null,
           executionMode: "read_only",
           parentTask: null,
           dependencies: [],
@@ -85,6 +161,7 @@ describe("repository lifecycle", () => {
           title: "Fix the bug",
           prompt: "Fix it",
           agentKind: "codex",
+          model: null,
           executionMode: "workspace_write",
           parentTask: null,
           dependencies: [{ taskID: null, clientKey: "scan" }],
@@ -227,6 +304,7 @@ describe("repository lifecycle", () => {
           title: "Work",
           prompt: "Work",
           agentKind: "codex",
+          model: null,
           executionMode: "workspace_write",
           parentTask: null,
           dependencies: [],
@@ -291,6 +369,7 @@ describe("repository lifecycle", () => {
             title: "A",
             prompt: "A",
             agentKind: "claude_code",
+            model: null,
             executionMode: "read_only",
             parentTask: null,
             dependencies: [],
@@ -300,6 +379,7 @@ describe("repository lifecycle", () => {
             title: "B",
             prompt: "B",
             agentKind: "claude_code",
+            model: null,
             executionMode: "read_only",
             parentTask: null,
             dependencies: [],
@@ -319,6 +399,7 @@ describe("repository lifecycle", () => {
             title: "X",
             prompt: "X",
             agentKind: "claude_code",
+            model: null,
             executionMode: "read_only",
             parentTask: null,
             dependencies: [{ taskID: null, clientKey: "y" }],
@@ -328,6 +409,7 @@ describe("repository lifecycle", () => {
             title: "Y",
             prompt: "Y",
             agentKind: "claude_code",
+            model: null,
             executionMode: "read_only",
             parentTask: null,
             dependencies: [{ taskID: null, clientKey: "x" }],
@@ -389,6 +471,7 @@ describe("repository lifecycle", () => {
           title: "Only",
           prompt: "Only",
           agentKind: "claude_code",
+          model: null,
           executionMode: "read_only",
           parentTask: null,
           dependencies: [],
@@ -444,6 +527,7 @@ describe("repository lifecycle", () => {
           title: "One",
           prompt: "One",
           agentKind: "claude_code",
+          model: null,
           executionMode: "read_only",
           parentTask: null,
           dependencies: [],

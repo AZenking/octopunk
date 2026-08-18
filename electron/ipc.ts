@@ -98,7 +98,8 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
       runID: string;
       title: string;
       prompt: string;
-      agentKind: "claude_code" | "codex";
+      agentKind: "claude_code" | "codex" | "pi";
+      model: string | null;
       executionMode: "read_only" | "workspace_write";
     };
     return environment.teamService.delegateTask({
@@ -107,6 +108,7 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
       title: request.title,
       prompt: request.prompt,
       agentKind: request.agentKind,
+      model: request.model ?? null,
       executionMode: request.executionMode,
       dependencies: [],
     });
@@ -237,23 +239,29 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
   });
 
   handle("agent:check", (payload) => {
-    const request = payload as { kind: "claude_code" | "codex"; override?: string | null };
+    const request = payload as { kind: "claude_code" | "codex" | "pi"; override?: string | null };
     return environment.checkAgent(request.kind, request.override ?? null);
   });
 
   handle("settings:get-executables", () => ({
     claudeExecutable: environment.settings.string(CLAUDE_EXECUTABLE_KEY) ?? "",
     codexExecutable: environment.settings.string(CODEX_EXECUTABLE_KEY) ?? "",
+    piExecutable: environment.settings.string(PI_EXECUTABLE_KEY) ?? "",
     resolved: {
       claudeExecutable: environment.claudeExecutable,
       codexExecutable: environment.codexExecutable,
+      piExecutable: environment.piExecutable,
     },
   }));
 
   handle("settings:set-executable", (payload) => {
-    const request = payload as { kind: "claude_code" | "codex"; path: string };
+    const request = payload as { kind: "claude_code" | "codex" | "pi"; path: string };
     environment.settings.set(
-      request.kind === "claude_code" ? CLAUDE_EXECUTABLE_KEY : CODEX_EXECUTABLE_KEY,
+      request.kind === "claude_code"
+        ? CLAUDE_EXECUTABLE_KEY
+        : request.kind === "pi"
+          ? PI_EXECUTABLE_KEY
+          : CODEX_EXECUTABLE_KEY,
       request.path,
     );
     return null;
@@ -362,6 +370,15 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
     const command = app.isPackaged ? process.execPath : process.execPath;
     const args = app.isPackaged ? ["--mcp-stdio"] : [appRoot, "--mcp-stdio"];
     const backup = await environment.codexConfig.connectStdio(command, args);
+    return { backupPath: backup };
+  });
+
+  handle("settings:connect-pi", async () => {
+    const { app } = await import("electron");
+    const appRoot = app.getAppPath();
+    const command = process.execPath;
+    const args = app.isPackaged ? ["--mcp-stdio"] : [appRoot, "--mcp-stdio"];
+    const backup = await environment.piConfig.connectStdio(command, args);
     return { backupPath: backup };
   });
 

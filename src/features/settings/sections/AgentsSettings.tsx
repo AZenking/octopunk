@@ -31,6 +31,11 @@ const AGENTS: { kind: ChildAgentKindValue; placeholder: string; hint: string }[]
     placeholder: "codex",
     hint: "app-server JSON-RPC 适配；权限审批按任务策略评估，不自动放行；保存后重启生效。",
   },
+  {
+    kind: "pi",
+    placeholder: "pi",
+    hint: "pi.dev CLI（--print --mode json）适配；会话经 --session 恢复；已安装 pi-mcp-extension 时子任务自动接入 context server（否则按快照回退）；pi 自行管理 provider 登录（终端运行 pi 后 /login）；保存后重启生效。",
+  },
 ];
 
 export function AgentsSettings() {
@@ -38,15 +43,37 @@ export function AgentsSettings() {
   const [executables, setExecutables] = useState<Record<ChildAgentKindValue, string>>({
     claude_code: "",
     codex: "",
+    pi: "",
   });
   const [dialogKind, setDialogKind] = useState<ChildAgentKindValue | null>(null);
+  const [modelDraft, setModelDraft] = useState("");
   const dialogAgent = AGENTS.find((agent) => agent.kind === dialogKind) ?? null;
+
+  // Seed the model override draft whenever the config dialog opens.
+  useEffect(() => {
+    if (dialogKind == null) return;
+    setModelDraft(
+      dialogKind === "claude_code"
+        ? appState.childModels.claudeModel
+        : dialogKind === "pi"
+          ? appState.childModels.piModel
+          : appState.childModels.codexModel,
+    );
+    // appState.childModels changes after saves; only re-seed on dialog open.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dialogKind]);
 
   useEffect(() => {
     void window.octopunk
-      .invoke<{ claudeExecutable: string; codexExecutable: string }>("settings:get-executables")
+      .invoke<{ claudeExecutable: string; codexExecutable: string; piExecutable: string }>(
+        "settings:get-executables",
+      )
       .then((value) => {
-        setExecutables({ claude_code: value.claudeExecutable, codex: value.codexExecutable });
+        setExecutables({
+          claude_code: value.claudeExecutable,
+          codex: value.codexExecutable,
+          pi: value.piExecutable,
+        });
       })
       .catch(() => {});
   }, []);
@@ -66,8 +93,7 @@ export function AgentsSettings() {
         <div className="border-border divide-border divide-y rounded-xl border">
           {AGENTS.map((agent) => {
             const disabled = appState.disabledAgents.has(agent.kind);
-            const availability =
-              agent.kind === "claude_code" ? appState.claudeAvailability : appState.codexAvailability;
+            const availability = appState.availability(agent.kind);
             return (
               <div key={agent.kind} className="flex items-center gap-3 px-5 py-4">
                 <AgentMark agentKind={agent.kind} className={cn(disabled && "opacity-50")} />
@@ -164,13 +190,27 @@ export function AgentsSettings() {
                 </Button>
               </div>
               <div className="text-muted-foreground min-h-4 text-[11px]">
-                <AvailabilityMeta
-                  result={
+                <AvailabilityMeta result={appState.availability(dialogAgent.kind)} />
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <p className="text-foreground text-sm font-medium">模型覆盖</p>
+                <Input
+                  aria-label={`${agentLabel(dialogAgent.kind)} 模型覆盖`}
+                  value={modelDraft}
+                  onChange={(event) => setModelDraft(event.target.value)}
+                  onBlur={() => appState.setChildModel(dialogAgent.kind, modelDraft.trim())}
+                  placeholder={
                     dialogAgent.kind === "claude_code"
-                      ? appState.claudeAvailability
-                      : appState.codexAvailability
+                      ? "如 glm-5.2；留空使用默认"
+                      : dialogAgent.kind === "pi"
+                        ? "如 anthropic/claude-sonnet-4-5；留空使用默认"
+                        : "如 gpt-5.5-codex；留空使用默认"
                   }
+                  className="font-mono text-xs"
                 />
+                <p className="text-muted-foreground text-[11px] leading-relaxed">
+                  仅影响 OctoPunk 派发的子任务；留空使用该 Agent 的默认模型。保存后对下一个任务生效。
+                </p>
               </div>
               <DialogFooter>
                 <Button variant="outline" onClick={() => setDialogKind(null)}>

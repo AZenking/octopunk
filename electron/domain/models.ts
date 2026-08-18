@@ -88,11 +88,13 @@ export function taskStatusIsTerminal(status: ChildTaskStatus): boolean {
 }
 
 /** The child-agent runtime chosen by the caller; part of the task contract. */
-export const CHILD_AGENT_KINDS = ["claude_code", "codex"] as const;
+export const CHILD_AGENT_KINDS = ["claude_code", "codex", "pi"] as const;
 export type ChildAgentKind = (typeof CHILD_AGENT_KINDS)[number];
 
 export function agentKindDisplayName(kind: ChildAgentKind): string {
-  return kind === "claude_code" ? "Claude Code" : "Codex";
+  if (kind === "claude_code") return "Claude Code";
+  if (kind === "codex") return "Codex";
+  return "Pi";
 }
 
 /** The least privilege the task is allowed to receive from its agent. */
@@ -218,6 +220,8 @@ export interface ChildTask {
   title: string;
   prompt: string;
   agentKind: ChildAgentKind;
+  /** Per-task model override; null falls back to the per-kind setting, then the agent default. */
+  model: string | null;
   executionMode: TaskExecutionMode;
   workspaceKind: TaskWorkspaceKind;
   baselineCommit: string;
@@ -244,6 +248,7 @@ export function makeChildTask(init: {
   title: string;
   prompt: string;
   agentKind?: ChildAgentKind;
+  model?: string | null;
   executionMode?: TaskExecutionMode;
   workspaceKind?: TaskWorkspaceKind;
   baselineCommit: string;
@@ -270,6 +275,7 @@ export function makeChildTask(init: {
     title: init.title,
     prompt: init.prompt,
     agentKind: init.agentKind ?? "claude_code",
+    model: init.model ?? null,
     executionMode: init.executionMode ?? "workspace_write",
     workspaceKind: init.workspaceKind ?? "isolated_write",
     baselineCommit: init.baselineCommit,

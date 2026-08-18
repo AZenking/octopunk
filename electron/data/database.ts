@@ -8,7 +8,7 @@ import Database from "better-sqlite3";
 export type SqliteDatabase = Database.Database;
 
 export const OctoPunkDatabaseMigrator = {
-  currentVersion: 8,
+  currentVersion: 9,
 
   migrate(db: SqliteDatabase): void {
     const currentVersion = OctoPunkDatabaseMigrator.readVersion(db);
@@ -16,7 +16,10 @@ export const OctoPunkDatabaseMigrator = {
     for (let version = currentVersion + 1; version <= OctoPunkDatabaseMigrator.currentVersion; version += 1) {
       const apply = OctoPunkDatabaseMigrator.stages[version];
       if (apply) {
-        apply(db);
+        // Each stage is atomic: a crash mid-stage must not leave the schema
+        // half-applied (which would make the next launch fail on re-running
+        // the same CREATE statements).
+        db.transaction(() => apply(db))();
       }
     }
   },
@@ -255,6 +258,13 @@ export const OctoPunkDatabaseMigrator = {
       // rows, which never match a session and therefore block nobody.
       db.exec("ALTER TABLE team_runs ADD COLUMN session_id TEXT");
       updateSchemaVersion(db, "8");
+    },
+
+    9(db: SqliteDatabase): void {
+      // Per-task model override; NULL keeps the per-kind setting (and then
+      // the agent's own default), so legacy rows need no backfill.
+      db.exec("ALTER TABLE child_tasks ADD COLUMN model TEXT");
+      updateSchemaVersion(db, "9");
     },
   } as Record<number, (db: SqliteDatabase) => void>,
 };

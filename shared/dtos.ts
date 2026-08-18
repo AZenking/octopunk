@@ -22,7 +22,7 @@ export type ChildTaskStatus =
   | "cancelled"
   | "failed";
 
-export type ChildAgentKind = "claude_code" | "codex";
+export type ChildAgentKind = "claude_code" | "codex" | "pi";
 export type TaskExecutionMode = "read_only" | "workspace_write";
 export type TaskWorkspaceKind = "shared_read_only" | "isolated_write";
 export type ReviewVerdict = "PASS" | "REWORK" | "BLOCKED";
@@ -54,6 +54,8 @@ export interface ChildTaskDTO {
   title: string;
   status: string;
   agentKind: string;
+  /** Per-task model override; null falls back to the per-kind setting. */
+  model: string | null;
   executionMode: string;
   workspaceKind: string;
   sessionID: string | null;

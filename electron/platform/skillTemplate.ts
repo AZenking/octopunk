@@ -4,7 +4,7 @@
 // the hand-maintained .zcode/skills/octopunk/SKILL.md; only the Connection
 // section and the version marker are generated per install.
 
-export type SkillTargetKind = "claude_code" | "codex";
+export type SkillTargetKind = "claude_code" | "codex" | "pi";
 
 /** Bump when rendered content changes; installed copies compare against it. */
 export const OCTOPUNK_SKILL_VERSION = 1;
@@ -52,6 +52,31 @@ ${cli}
 
 ${CONNECTION_FALLBACK}`;
   }
+  if (kind === "pi") {
+    const config = JSON.stringify(
+      {
+        mcpServers: {
+          octopunk: {
+            command,
+            args,
+            transport: "stdio",
+            lifecycle: "eager",
+          },
+        },
+      },
+      null,
+      2,
+    );
+    return `## Connection
+
+Skills under \`~/.pi/agent/skills/\` are discovered automatically. pi has no built-in MCP client, so first install the bridge extension (\`pi install npm:pi-mcp-extension\`), then merge this server into \`~/.pi/agent/mcp.json\` (create the file if missing; \`eager\` starts the server with every session):
+
+\`\`\`json
+${config}
+\`\`\`
+
+Verify with \`/mcp\` inside pi. ${CONNECTION_FALLBACK}`;
+  }
   return `## Connection
 
 Skills under \`~/.codex/skills/\` are discovered automatically. To let Codex reach the local server, register the \`octopunk\` MCP once in \`~/.codex/config.toml\` — or use OctoPunk → 设置 → 连接与 MCP → 连接 Codex, which writes (and backs up) the entry for you:
@@ -69,7 +94,7 @@ const BODY_TAIL = `## Operating workflow
 
 1. Establish a TeamRun. If the user already supplied \`run_id\`, use it. Otherwise call \`start_team\` with the repository path, task description, and baseline information available from the repository. OctoPunk permits one active TeamRun; if creation is rejected because another run is active, report that fact and do not cancel or reuse it without explicit direction.
 
-2. Select the execution contract explicitly. Use \`agent_kind: "claude_code"\` by default because Claude is the active production adapter; use \`codex\` only when the user explicitly requests it and the Codex adapter is enabled. Use \`execution_mode: "read_only"\` for investigations and audits, and \`workspace_write\` only for requested code changes.
+2. Select the execution contract explicitly. Use \`agent_kind: "claude_code"\` by default because Claude is the active production adapter; use \`codex\` or \`pi\` only when the user explicitly requests it and that adapter is enabled. Use \`execution_mode: "read_only"\` for investigations and audits, and \`workspace_write\` only for requested code changes.
 
 3. For multiple children, call \`delegate_tasks\` once with the complete array. It is atomic: validate every item and reference before creation. Each item needs a unique \`client_key\`, title, prompt, agent kind, and execution mode. A \`parent_task\` or dependency reference must contain exactly one of \`task_id\` or same-batch \`client_key\`. Parentage controls hierarchy and context; only \`dependencies\` control execution order.
 

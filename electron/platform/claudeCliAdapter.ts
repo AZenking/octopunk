@@ -158,6 +158,8 @@ export class ClaudeCLIAdapter implements ChildAgentPort {
         PATH: [executableDirectory, process.env.PATH ?? ""].filter(Boolean).join(path.delimiter),
         ...(environment.contextServer?.environment ?? {}),
         ...this.providerEnvironment,
+        // Settings → 子 Agent 模型 wins over any forwarded provider mapping.
+        ...(environment.childModel != null ? { ANTHROPIC_MODEL: environment.childModel } : {}),
       };
       const request: ProcessRequest = {
         id: processID,
@@ -504,19 +506,26 @@ function isJson(value: unknown): value is Json {
   return typeof value === "object" && value != null && !Array.isArray(value);
 }
 
-export function sandboxProfile(worktreeURL: string, allowNetwork: boolean): string {
+export function sandboxProfile(
+  worktreeURL: string,
+  allowNetwork: boolean,
+  extraWritablePaths: string[] = [],
+): string {
   const escaped = (value: string): string =>
     value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
   const worktreePath = escaped(path.resolve(worktreeURL));
   const claudeStatePath = escaped(path.join(os.homedir(), ".claude"));
   const networkRule = allowNetwork ? "(allow network-outbound)" : "(deny network*)";
+  const extraRules = extraWritablePaths.map(
+    (entry) => `    (subpath "${escaped(entry)}")`,
+  );
   return `(version 1)
 ${networkRule}
 (allow process*)
 (allow file-read*)
 (allow file-write*
     (subpath "${worktreePath}")
-    (subpath "${claudeStatePath}")
+    (subpath "${claudeStatePath}")${extraRules.length > 0 ? "\n" + extraRules.join("\n") : ""}
     (subpath "/tmp"))
 `;
 }

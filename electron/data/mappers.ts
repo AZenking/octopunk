@@ -97,6 +97,7 @@ export const DatabaseMappers = {
       title: row.title as string,
       prompt: row.prompt as string,
       agentKind: parseEnum<ChildAgentKind>(CHILD_AGENT_KINDS, row.agent_kind, "claude_code"),
+      model: optionalString(row, "model"),
       executionMode: parseEnum<TaskExecutionMode>(TASK_EXECUTION_MODES, row.execution_mode, "workspace_write"),
       workspaceKind: parseEnum<TaskWorkspaceKind>(TASK_WORKSPACE_KINDS, row.workspace_kind, "isolated_write"),
       baselineCommit: row.baseline_commit as string,

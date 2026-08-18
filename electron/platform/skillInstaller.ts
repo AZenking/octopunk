@@ -21,6 +21,7 @@ export type SelfCommandProvider = () => { command: string; args: string[] };
 const SKILL_DIRECTORIES: Record<SkillTargetKind, (home: string) => string> = {
   claude_code: (home) => path.join(home, ".claude", "skills", "octopunk"),
   codex: (home) => path.join(home, ".codex", "skills", "octopunk"),
+  pi: (home) => path.join(home, ".pi", "agent", "skills", "octopunk"),
 };
 
 export class FileSkillInstaller implements SkillInstallerPort {

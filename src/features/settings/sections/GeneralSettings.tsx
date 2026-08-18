@@ -35,7 +35,7 @@ interface WorktreeEntry {
   reason: string;
 }
 
-const SKILL_TARGETS: ChildAgentKindValue[] = ["claude_code", "codex"];
+const SKILL_TARGETS: ChildAgentKindValue[] = ["claude_code", "codex", "pi"];
 
 function SkillStateBadge({ state }: { state: "not_installed" | "installed" | "update_available" }) {
   if (state === "installed") {
@@ -232,7 +232,8 @@ export function GeneralSettings() {
         <p className="text-muted-foreground mt-2 text-[11px] leading-relaxed">
           将 OctoPunk 编排技能（start_team / delegate_tasks / join_tasks 等 MCP 工作流）安装到各 Agent 的
           skills 目录。Claude Code 需按 skill 内说明执行一次 claude mcp add 注册 MCP；Codex
-          可用「连接与 MCP → 连接 Codex」自动写入。不影响 OctoPunk 自己派发的子 Agent（隔离运行、禁止递归编排）；覆盖安装会自动备份原文件。
+          可用「连接与 MCP → 连接 Codex」自动写入；pi 需先安装 pi-mcp-extension 扩展并按说明配置
+          ~/.pi/agent/mcp.json。不影响 OctoPunk 自己派发的子 Agent（隔离运行、禁止递归编排）；覆盖安装会自动备份原文件。
         </p>
       </section>
 

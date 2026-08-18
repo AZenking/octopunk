@@ -34,6 +34,8 @@ export class ChildExecutionService {
   private readonly allowNetwork: boolean;
   /** Read fresh at every execution so Settings edits apply to the next task. */
   private readonly globalInstructions?: () => string | null;
+  /** Settings → 子 Agent 模型 override per agent kind, read at execution time. */
+  private readonly childModel?: (agentKind: ChildAgentKind) => string | null;
   /** Path to this OctoPunk executable, spawned per task as a restricted context MCP server. */
   private readonly selfExecutablePath: string | null;
   /** Coalesces the first detached worktree creation for read-only children. */
@@ -46,12 +48,14 @@ export class ChildExecutionService {
     allowNetwork?: boolean;
     selfExecutablePath?: string | null;
     globalInstructions?: () => string | null;
+    childModel?: (agentKind: ChildAgentKind) => string | null;
   }) {
     this.childAgent = input.childAgent;
     this.git = input.git;
     this.repository = input.repository ?? null;
     this.allowNetwork = input.allowNetwork ?? false;
     this.globalInstructions = input.globalInstructions;
+    this.childModel = input.childModel;
     const candidate = input.selfExecutablePath ?? process.execPath;
     this.selfExecutablePath = isExecutable(candidate) ? candidate : null;
   }
@@ -94,6 +98,7 @@ export class ChildExecutionService {
       contextServer: this.selfExecutablePath
         ? OctoPunkContextServer.make(this.selfExecutablePath, run.id, task.id)
         : null,
+      childModel: task.model ?? this.childModel?.(task.agentKind) ?? null,
     });
     const taskExecutionInstructions =
       task.executionMode === "read_only"

@@ -12,6 +12,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import type { AgentTeamServicePortLike } from "./serviceTypes";
 import type { ContextFetchService } from "../application/contextFetchService";
+import { DEFAULT_MAX_CONCURRENT_TASKS } from "../../shared/ipc";
 import type { GitPort, KeychainPort } from "../application/ports";
 import { TaskEventHub } from "../domain/events";
 import type { TaskEventUpdate } from "../domain/events";
@@ -46,6 +47,7 @@ export class OctoPunkMCPServer {
   private readonly keychain: KeychainPort;
   private readonly eventHub: TaskEventHub | null;
   private readonly readOnlyContext: ContextFetchService | null;
+  private readonly defaultMaxConcurrentTasks: (() => number) | null;
   private readonly endpointURL: URL;
   private token: string | null = null;
   private httpApplication: OctoPunkHTTPApplication | null = null;
@@ -57,6 +59,8 @@ export class OctoPunkMCPServer {
     endpoint?: string;
     eventHub?: TaskEventHub | null;
     readOnlyContext?: ContextFetchService | null;
+    /** Stored OctoPunk.maxConcurrentTasks, used when a caller omits the argument. */
+    defaultMaxConcurrentTasks?: () => number;
   }) {
     this.service = input.service;
     this.git = input.git;
@@ -64,6 +68,7 @@ export class OctoPunkMCPServer {
     this.eventHub = input.eventHub ?? null;
     this.readOnlyContext = input.readOnlyContext ?? null;
     this.endpointURL = new URL(input.endpoint ?? MCP_ENDPOINT);
+    this.defaultMaxConcurrentTasks = input.defaultMaxConcurrentTasks ?? null;
   }
 
   accessToken(): string | null {
@@ -104,7 +109,7 @@ export class OctoPunkMCPServer {
       });
     }
     process.once("exit", failSession);
-    const server = makeFullServer(this.service, this.git, sessionID);
+    const server = makeFullServer(this.service, this.git, sessionID, this.defaultMaxConcurrentTasks);
     let subscription: string | null = null;
     if (this.eventHub != null) {
       subscription = this.eventHub.subscribe((update) => {
@@ -130,7 +135,8 @@ export class OctoPunkMCPServer {
       port: Number.parseInt(this.endpointURL.port, 10) || 51931,
       endpoint: this.endpointURL.pathname.length === 0 ? "/mcp" : this.endpointURL.pathname,
       token,
-      serverFactory: (sessionID) => Promise.resolve(makeFullServer(this.service, this.git, sessionID)),
+      serverFactory: (sessionID) =>
+        Promise.resolve(makeFullServer(this.service, this.git, sessionID, this.defaultMaxConcurrentTasks)),
       onSessionClose: (sessionID) =>
         this.service.failActiveRunsForSession({ sessionID, reason: "session closed" }),
     });
@@ -178,12 +184,24 @@ function waitForClose(server: Server, transport: StdioServerTransport): Promise<
   });
 }
 
-function makeFullServer(service: AgentTeamServicePortLike, git: GitPort, sessionID: string): Server {
+function makeFullServer(
+  service: AgentTeamServicePortLike,
+  git: GitPort,
+  sessionID: string,
+  defaultMaxConcurrentTasks: (() => number) | null,
+): Server {
   const server = new Server({ name: "octopunk", version: "1.0.0" }, { capabilities: { tools: { listChanged: false } } });
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: fullToolList() }));
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     try {
-      const result = await dispatchTool(service, git, request.params.name, request.params.arguments ?? {}, sessionID);
+      const result = await dispatchTool(
+        service,
+        git,
+        request.params.name,
+        request.params.arguments ?? {},
+        sessionID,
+        defaultMaxConcurrentTasks,
+      );
       return { content: [{ type: "text", text: result }] };
     } catch (error) {
       return {
@@ -278,6 +296,7 @@ function delegateTasksSchema(): Record<string, unknown> {
         title: stringSchema(),
         prompt: stringSchema(),
         agent_kind: stringSchema(),
+        model: stringSchema(),
         execution_mode: stringSchema(),
         parent_task: taskReferenceSchema(),
         dependencies: { type: "array", items: taskReferenceSchema() },
@@ -331,6 +350,7 @@ export function fullToolList(): Tool[] {
         title: stringSchema(),
         prompt: stringSchema(),
         agent_kind: stringSchema(),
+        model: stringSchema(),
         execution_mode: stringSchema(),
         dependencies: arraySchema(),
       },
@@ -521,6 +541,13 @@ function optionalString(arguments_: Arguments, key: string): string | undefined 
   return typeof value === "string" ? value : undefined;
 }
 
+/** Optional per-task model override: trim, empty → null (per-kind setting applies). */
+function optionalModel(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? null : trimmed;
+}
+
 function optionalInteger(arguments_: Arguments, key: string): number | undefined {
   const value = arguments_[key];
   return typeof value === "number" ? value : undefined;
@@ -592,6 +619,7 @@ async function dispatchTool(
   name: string,
   arguments_: Arguments,
   sessionID: string,
+  defaultMaxConcurrentTasks: (() => number) | null = null,
 ): Promise<string> {
   switch (name) {
     case "start_team": {
@@ -607,7 +635,10 @@ async function dispatchTool(
         task: requireString(arguments_, "task"),
         baselineCommit: baseline,
         targetBranch,
-        maxConcurrentTasks: optionalInteger(arguments_, "max_concurrent_tasks") ?? 3,
+        maxConcurrentTasks:
+          optionalInteger(arguments_, "max_concurrent_tasks") ??
+          defaultMaxConcurrentTasks?.() ??
+          DEFAULT_MAX_CONCURRENT_TASKS,
         maxReviewRounds: optionalInteger(arguments_, "max_review_rounds") ?? 5,
       });
       return stableStringify(result);
@@ -627,6 +658,7 @@ async function dispatchTool(
         title: requireString(arguments_, "title"),
         prompt: requireString(arguments_, "prompt"),
         agentKind,
+        model: optionalModel(arguments_.model),
         executionMode,
         dependencies: uuidArray(arguments_, "dependencies"),
       });
@@ -827,6 +859,7 @@ function taskItems(value: unknown): import("../domain/repositoryPort").DelegateT
       title,
       prompt,
       agentKind: rawAgent,
+      model: optionalModel(object.model),
       executionMode: rawMode,
       parentTask,
       dependencies,

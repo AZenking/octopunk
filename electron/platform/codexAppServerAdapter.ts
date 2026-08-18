@@ -20,7 +20,11 @@ import {
 
 /** Explicit registry: task.agent_kind, not prompt wording, selects the adapter. */
 export class ChildAgentRegistry implements ChildAgentPort {
-  constructor(private readonly claude: ChildAgentPort, private readonly codex: ChildAgentPort) {}
+  constructor(
+    private readonly claude: ChildAgentPort,
+    private readonly codex: ChildAgentPort,
+    private readonly pi: ChildAgentPort,
+  ) {}
 
   async start(
     prompt: string,
@@ -52,7 +56,9 @@ export class ChildAgentRegistry implements ChildAgentPort {
   }
 
   private adapter(kind: ChildAgentKind): ChildAgentPort {
-    return kind === "claude_code" ? this.claude : this.codex;
+    if (kind === "claude_code") return this.claude;
+    if (kind === "pi") return this.pi;
+    return this.codex;
   }
 }
 
@@ -513,6 +519,8 @@ class CodexJSONRPCConnection {
       developerInstructions:
         "Follow OctoPunk task policy. This is a leaf sub-agent: do not spawn or delegate other agents, do not use MCP tools, web, computer, commit, push, or network shell commands.",
       mcp_servers: {},
+      // Settings → 子 Agent 模型 override; omitted keeps the Codex default.
+      ...(this.environment.childModel != null ? { model: this.environment.childModel } : {}),
     };
   }
 

@@ -10,10 +10,12 @@ import { SqliteTeamRunRepository } from "./data/repository";
 import { LocalProcessAdapter, isExecutable } from "./platform/processAdapter";
 import { GitAdapter } from "./platform/gitAdapter";
 import { ClaudeCLIAdapter } from "./platform/claudeCliAdapter";
+import { PiCLIAdapter } from "./platform/piCliAdapter";
 import { CodexAppServerAdapter, ChildAgentRegistry } from "./platform/codexAppServerAdapter";
 import { OctoPunkToolLocator } from "./platform/toolLocator";
 import { KeychainTokenStore } from "./platform/keychainTokenStore";
 import { FileCodexConfigAdapter } from "./platform/codexConfigAdapter";
+import { FilePiConfigAdapter } from "./platform/piConfigAdapter";
 import { FileSkillInstaller } from "./platform/skillInstaller";
 import { MainAppLoginItemAdapter } from "./platform/loginItemAdapter";
 import { NotificationAdapter } from "./platform/notificationAdapter";
@@ -25,13 +27,26 @@ import { ContextFetchService } from "./application/contextFetchService";
 import { TaskEventHub } from "./domain/events";
 import { OctoPunkMCPServer } from "./mcp/server";
 import {
+  CLAUDE_CHILD_MODEL_KEY,
   CLAUDE_EXECUTABLE_KEY,
+  CODEX_CHILD_MODEL_KEY,
   CODEX_EXECUTABLE_KEY,
   CUSTOM_INSTRUCTIONS_KEY,
+  LAUNCH_STAGGER_SECONDS_KEY,
   LEGACY_CLAUDE_EXECUTABLE_KEY,
+  MAX_CONCURRENT_TASKS_KEY,
+  PI_CHILD_MODEL_KEY,
+  PI_EXECUTABLE_KEY,
+  TASK_RETRY_LIMIT_KEY,
   SettingsStore,
   octoPunkSupportDirectory,
 } from "./settingsStore";
+import {
+  clampLaunchStaggerSeconds,
+  clampTaskRetryLimit,
+  DEFAULT_MAX_CONCURRENT_TASKS,
+  MAX_CONCURRENT_TASKS_LIMIT,
+} from "../shared/ipc";
 import { ChildAgentDiagnostics, type ChildAgentAvailability } from "./application/ports";
 
 export class AppEnvironment {
@@ -41,6 +56,7 @@ export class AppEnvironment {
   readonly git: GitAdapter;
   readonly claude: ClaudeCLIAdapter;
   readonly codex: CodexAppServerAdapter;
+  readonly pi: PiCLIAdapter;
   readonly childAgents: ChildAgentRegistry;
   readonly childExecution: ChildExecutionService;
   readonly integration: TaskIntegrationService;
@@ -50,6 +66,7 @@ export class AppEnvironment {
   readonly eventHub: TaskEventHub;
   readonly keychain: KeychainTokenStore;
   readonly codexConfig: FileCodexConfigAdapter;
+  readonly piConfig: FilePiConfigAdapter;
   readonly skillInstaller: FileSkillInstaller;
   readonly loginItem: MainAppLoginItemAdapter;
   readonly mcpServer: OctoPunkMCPServer;
@@ -57,8 +74,14 @@ export class AppEnvironment {
   readonly settings: SettingsStore;
   readonly claudeExecutable: string;
   readonly codexExecutable: string;
+  readonly piExecutable: string;
 
-  constructor(input?: { databaseURL?: string | null; claudeExecutable?: string | null; codexExecutable?: string | null }) {
+  constructor(input?: {
+    databaseURL?: string | null;
+    claudeExecutable?: string | null;
+    codexExecutable?: string | null;
+    piExecutable?: string | null;
+  }) {
     this.settings = new SettingsStore();
     // OCTOPUNK_DATABASE_URL isolates the instance (used by tests/diagnostics)
     // without touching ~/Library/Application Support/OctoPunk/octopunk.sqlite.
@@ -82,7 +105,12 @@ export class AppEnvironment {
       "codex",
     );
     this.codex = new CodexAppServerAdapter(this.codexExecutable, this.process);
-    this.childAgents = new ChildAgentRegistry(this.claude, this.codex);
+    this.piExecutable = OctoPunkToolLocator.resolveConfigured(
+      this.settings.string(PI_EXECUTABLE_KEY) ?? input?.piExecutable ?? null,
+      "pi",
+    );
+    this.pi = new PiCLIAdapter(this.piExecutable, this.process);
+    this.childAgents = new ChildAgentRegistry(this.claude, this.codex, this.pi);
     // Claude must reach its model endpoint. Its built-in network tools and
     // commit/push commands remain denied by each adapter's explicit policy.
     this.childExecution = new ChildExecutionService({
@@ -95,6 +123,15 @@ export class AppEnvironment {
       // is updated in-process by settings:set-custom-instructions, so reads
       // here always see the latest saved value.
       globalInstructions: () => this.settings.string(CUSTOM_INSTRUCTIONS_KEY) ?? null,
+      // Settings → 外部 Agent → 模型覆盖, read per execution.
+      childModel: (kind) =>
+        this.settings.string(
+          kind === "claude_code"
+            ? CLAUDE_CHILD_MODEL_KEY
+            : kind === "pi"
+              ? PI_CHILD_MODEL_KEY
+              : CODEX_CHILD_MODEL_KEY,
+        ) ?? null,
     });
     this.integration = new TaskIntegrationService(this.git);
     this.eventHub = new TaskEventHub();
@@ -103,10 +140,16 @@ export class AppEnvironment {
       childExecution: this.childExecution,
       integration: this.integration,
       eventHub: this.eventHub,
+      // Settings → 常规: auto-retry budget + launch pacing, read per use.
+      executionPolicy: () => ({
+        taskRetryLimit: clampTaskRetryLimit(this.settings.string(TASK_RETRY_LIMIT_KEY)),
+        launchStaggerSeconds: clampLaunchStaggerSeconds(this.settings.string(LAUNCH_STAGGER_SECONDS_KEY)),
+      }),
     });
     this.queryService = new TeamQueryService(this.repository);
     this.keychain = new KeychainTokenStore();
     this.codexConfig = new FileCodexConfigAdapter();
+    this.piConfig = new FilePiConfigAdapter();
     // Same self-launch command the Codex MCP writer uses, embedded into the
     // installed skill's Connection section.
     this.skillInstaller = new FileSkillInstaller({
@@ -127,16 +170,17 @@ export class AppEnvironment {
       keychain: this.keychain,
       eventHub: this.eventHub,
       readOnlyContext: this.contextFetch,
+      defaultMaxConcurrentTasks: () => storedDefaultMaxConcurrentTasks(this.settings),
     });
   }
 
   async checkAgent(
-    kind: "claude_code" | "codex",
+    kind: "claude_code" | "codex" | "pi",
     executableOverride?: string | null,
   ): Promise<ChildAgentAvailability> {
     const executable = OctoPunkToolLocator.resolveConfigured(
       executableOverride,
-      kind === "claude_code" ? "claude" : "codex",
+      kind === "claude_code" ? "claude" : kind === "pi" ? "pi" : "codex",
     );
     if (!isExecutable(executable)) {
       return {
@@ -177,6 +221,12 @@ export class AppEnvironment {
  * this app with `--mcp-stdio`. Packaged builds use the app executable
  * directly; `electron .` dev runs get a generated launcher script.
  */
+function storedDefaultMaxConcurrentTasks(settings: SettingsStore): number {
+  const parsed = Number.parseInt(settings.string(MAX_CONCURRENT_TASKS_KEY) ?? "", 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_MAX_CONCURRENT_TASKS;
+  return Math.min(MAX_CONCURRENT_TASKS_LIMIT, Math.max(1, Math.round(parsed)));
+}
+
 export function resolveSelfExecutable(): string {
   const appRoot = app.getAppPath();
   const packaged = app.isPackaged;

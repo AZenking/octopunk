@@ -49,7 +49,7 @@ export function AgentList({
                 <div className="mt-1.5 flex items-center gap-2">
                   <StatusBadge status={taskStatusToAgent(task.status)} />
                   <span className="text-muted-foreground truncate font-mono text-xs">
-                    {task.agentKind === "codex" ? "codex" : "claude"}·
+                    {task.agentKind === "codex" ? "codex" : task.agentKind === "pi" ? "pi" : "claude"}·
                     {task.executionMode === "read_only" ? "RO" : "RW"}
                   </span>
                 </div>

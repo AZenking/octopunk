@@ -55,6 +55,16 @@ export function ConnectionsSettings() {
             }
           />
           <Row
+            title="连接 Pi"
+            desc="写入 ~/.pi/agent/mcp.json"
+            hint="向 pi 的 MCP 配置合并 octopunk STDIO 条目（eager），保留其他 server；原文件自动备份。需先安装 pi-mcp-extension 扩展（pi install npm:pi-mcp-extension），pi 本身不内置 MCP 客户端。"
+            control={
+              <Button variant="outline" size="sm" onClick={() => void appState.connectPi()}>
+                连接 Pi
+              </Button>
+            }
+          />
+          <Row
             title="HTTP 兼容"
             desc="127.0.0.1:51931/mcp"
             hint="Bearer 令牌存 Keychain；仅显式开启，STDIO 始终为默认传输。开关即当前状态。"

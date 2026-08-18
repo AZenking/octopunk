@@ -1,16 +1,22 @@
 // Tests for ChildExecutionService prompt assembly, focusing on host-wide
-// custom instructions (AGENTS.md-style global guidance) injection.
+// custom instructions (AGENTS.md-style global guidance) injection and the
+// per-task model override precedence.
 
 import { describe, expect, it } from "vitest";
 import { ChildExecutionService } from "../electron/application/childExecutionService";
-import type { ChildAgentReport, GitPort } from "../electron/application/ports";
+import type { ChildAgentEnvironment, ChildAgentReport, GitPort } from "../electron/application/ports";
 import { makeChildTask, makeTeamRun, type ChildTask, type TeamRun } from "../electron/domain/models";
 
-function makeFixture(globalInstructions?: () => string | null): {
+function makeFixture(
+  globalInstructions?: () => string | null,
+  childModel?: (agentKind: ChildTask["agentKind"]) => string | null,
+): {
   prompts: string[];
+  environments: ChildAgentEnvironment[];
   service: ChildExecutionService;
 } {
   const prompts: string[] = [];
+  const environments: ChildAgentEnvironment[] = [];
   const report: ChildAgentReport = {
     sessionID: "session-1",
     message: "done",
@@ -21,8 +27,9 @@ function makeFixture(globalInstructions?: () => string | null): {
     blocker: null,
   };
   const childAgent = {
-    start: async (prompt: string): Promise<ChildAgentReport> => {
+    start: async (prompt: string, environment: ChildAgentEnvironment): Promise<ChildAgentReport> => {
       prompts.push(prompt);
+      environments.push(environment);
       return report;
     },
     resume: async (_sessionID: string, prompt: string): Promise<ChildAgentReport> => {
@@ -60,8 +67,9 @@ function makeFixture(globalInstructions?: () => string | null): {
     git,
     repository: null,
     globalInstructions,
+    childModel,
   });
-  return { prompts, service };
+  return { prompts, environments, service };
 }
 
 function makeRunAndTask(overrides?: Partial<ChildTask>): { run: TeamRun; task: ChildTask } {
@@ -127,5 +135,28 @@ describe("ChildExecutionService global instructions", () => {
     await service.execute(run, task);
     expect(prompts[0]).toContain("[host-wide instructions truncated]");
     expect(prompts[0].length).toBeLessThan(32 * 1024 + 1000);
+  });
+});
+
+describe("ChildExecutionService model override precedence", () => {
+  it("prefers the task-level model over the per-kind setting", async () => {
+    const { environments, service } = makeFixture(undefined, () => "glm-5.2");
+    const { run, task } = makeRunAndTask({ model: "glm-5-air" });
+    await service.execute(run, task);
+    expect(environments[0].childModel).toBe("glm-5-air");
+  });
+
+  it("falls back to the per-kind setting when the task has no model", async () => {
+    const { environments, service } = makeFixture(undefined, () => "glm-5.2");
+    const { run, task } = makeRunAndTask();
+    await service.execute(run, task);
+    expect(environments[0].childModel).toBe("glm-5.2");
+  });
+
+  it("stays null when neither layer overrides", async () => {
+    const { environments, service } = makeFixture();
+    const { run, task } = makeRunAndTask();
+    await service.execute(run, task);
+    expect(environments[0].childModel).toBeNull();
   });
 });

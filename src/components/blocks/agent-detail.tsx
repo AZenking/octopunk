@@ -3,7 +3,7 @@
 // Attached block `agent-detail` adapted: agent = child task, its "sub agents"
 // are the task's execution attempts (drill into the execution view).
 
-import { Activity, ChevronRight, CircleStop, Clock, GitBranch, RotateCw, Trash2 } from "lucide-react";
+import { Activity, ChevronRight, CircleStop, Clock, Cpu, GitBranch, RotateCw, Trash2 } from "lucide-react";
 import type { ChildTaskDTO, TaskAttemptDTO } from "../../../shared/dtos";
 import { attemptDurationMs, formatDuration, taskStatusToAgent } from "@/lib/agentView";
 import { StatusBadge, StatusDot } from "@/components/blocks/status-badge";
@@ -100,14 +100,15 @@ export function AgentDetail({
         </div>
       </header>
 
-      <div className="grid grid-cols-1 gap-3 px-8 py-6 sm:grid-cols-3">
+      <div className="grid grid-cols-1 gap-3 px-8 py-6 sm:grid-cols-3 lg:grid-cols-4">
         <Stat label="执行次数" value={String(attempts.length)} icon={<Activity className="size-3.5" />} />
         <Stat label="审查轮次" value={String(task.reviewRound)} icon={<GitBranch className="size-3.5" />} />
         <Stat
           label="Agent / 模式"
-          value={`${task.agentKind === "codex" ? "codex" : "claude"}·${task.executionMode === "read_only" ? "RO" : "RW"}`}
+          value={`${task.agentKind === "codex" ? "codex" : task.agentKind === "pi" ? "pi" : "claude"}·${task.executionMode === "read_only" ? "RO" : "RW"}`}
           icon={<Clock className="size-3.5" />}
         />
+        <Stat label="模型" value={task.model ?? "全局覆盖"} icon={<Cpu className="size-3.5" />} />
       </div>
 
       {(reviewable || cancellable) && (

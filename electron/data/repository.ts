@@ -151,6 +151,7 @@ export class SqliteTeamRunRepository implements TeamRunRepository {
             title: input.title,
             prompt: input.prompt,
             agentKind: input.agentKind,
+            model: input.model,
             executionMode: input.executionMode,
             parentTask: null,
             dependencies: input.dependencies.map((taskID) => ({ taskID, clientKey: null })),
@@ -523,6 +524,8 @@ export class SqliteTeamRunRepository implements TeamRunRepository {
     runID: string;
     taskID: string;
     summary: string;
+    /** False when an automatic retry is pending: the task failed but the run keeps draining siblings. */
+    blockRun?: boolean;
   }): Promise<ChildTask> {
     return this.write((db) => {
       const cached = cachedResponse<ChildTask>(db, input.requestID);
@@ -546,8 +549,10 @@ export class SqliteTeamRunRepository implements TeamRunRepository {
           failure: input.summary,
         });
       }
-      const run = requireRunSync(db, input.runID);
-      updateRunSync(db, run, "blocked");
+      if (input.blockRun !== false) {
+        const run = requireRunSync(db, input.runID);
+        updateRunSync(db, run, "blocked");
+      }
       appendEvent(db, {
         runID: input.runID,
         taskID: input.taskID,
@@ -1608,6 +1613,12 @@ export function suffixUTF8(value: string, byteLimit: number): string {
   return data.subarray(data.length - byteLimit).toString("utf8");
 }
 
+/** Mirrors the Settings child-model cap: trim, empty → null, 100 chars. */
+function normalizeTaskModel(model: string | null | undefined): string | null {
+  const trimmed = (model ?? "").trim();
+  return trimmed.length === 0 ? null : trimmed.slice(0, 100);
+}
+
 function createTaskBatch(db: SqliteDatabase, input: DelegateTasksInput): DelegateTasksResult {
   if (input.tasks.length === 0) {
     throw DomainError.invalidTask("At least one child task is required.");
@@ -1685,6 +1696,7 @@ function createTaskBatch(db: SqliteDatabase, input: DelegateTasksInput): Delegat
         title: item.title,
         prompt: item.prompt,
         agentKind: item.agentKind,
+        model: normalizeTaskModel(item.model),
         executionMode: item.executionMode,
         workspaceKind,
         baselineCommit: run.baselineCommit,
@@ -1717,11 +1729,11 @@ function createTaskBatch(db: SqliteDatabase, input: DelegateTasksInput): Delegat
     db.prepare(
       `INSERT INTO child_tasks(
           id, run_id, batch_id, client_key, parent_task_id, title, prompt,
-          agent_kind, execution_mode, workspace_kind, baseline_commit,
+          agent_kind, model, execution_mode, workspace_kind, baseline_commit,
           branch_name, worktree_path, context_snapshot, session_id,
           current_attempt_id, status, latest_report, latest_error,
           review_round, revision, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       task.id,
       task.runID,
@@ -1731,6 +1743,7 @@ function createTaskBatch(db: SqliteDatabase, input: DelegateTasksInput): Delegat
       task.title,
       task.prompt,
       task.agentKind,
+      task.model,
       task.executionMode,
       task.workspaceKind,
       task.baselineCommit,
@@ -1766,6 +1779,7 @@ function createTaskBatch(db: SqliteDatabase, input: DelegateTasksInput): Delegat
           parent_task_id: task.parentTaskID ?? "",
           title: task.title,
           agent_kind: task.agentKind,
+          model: task.model ?? "",
           execution_mode: task.executionMode,
           workspace_kind: task.workspaceKind,
         }),

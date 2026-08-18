@@ -12,6 +12,7 @@
 //   node tools/mcp-trace.mjs --db real                # use the live DB (run shows up in the GUI sidebar)
 //   node tools/mcp-trace.mjs --tasks 4                # 4 tasks: 3 run concurrently, 1 queues
 //   node tools/mcp-trace.mjs --agent codex --mode workspace_write
+//   node tools/mcp-trace.mjs --models glm-5.2,glm-5.3 # per-task model overrides (task N uses entry N)
 //   node tools/mcp-trace.mjs --no-accept              # stop after the report, before review
 //   node tools/mcp-trace.mjs --keep                   # never discard worktrees at the end
 //   node tools/mcp-trace.mjs --verbose                # full JSON payloads
@@ -33,7 +34,9 @@ const flags = {
   mode: "read_only",
   title: null,
   prompt: null,
+  prompts: [], // per-task prompts separated by "||"; missing entries fall back to --prompt
   tasks: 1,
+  models: [], // per-task model overrides; task N uses entry N (unset = per-kind default)
   db: "temp", // temp | real
   pollMs: 3000,
   maxWaitSecs: 300,
@@ -54,7 +57,9 @@ for (let index = 2; index < process.argv.length; index += 1) {
     case "--mode": flags.mode = value(); break;
     case "--title": flags.title = value(); break;
     case "--prompt": flags.prompt = value(); break;
+    case "--prompts": flags.prompts = value().split("||").map((p) => p.trim()).filter(Boolean); break;
     case "--tasks": flags.tasks = Number.parseInt(value(), 10); break;
+    case "--models": flags.models = value().split(",").map((model) => model.trim()).filter(Boolean); break;
     case "--db": flags.db = value(); break;
     case "--poll-ms": flags.pollMs = Number.parseInt(value(), 10); break;
     case "--max-wait-secs": flags.maxWaitSecs = Number.parseInt(value(), 10); break;
@@ -264,12 +269,13 @@ try {
   const runID = start.run.id;
   line(`run ${runID.slice(0, 8)} status=${start.run.status} baseline=${start.run.baselineCommit.slice(0, 10)} target=${start.run.targetBranch || "detached"}`);
 
-  step(5, `delegate_tasks (${flags.tasks} × ${flags.agent}/${flags.mode})`);
+  step(5, `delegate_tasks (${flags.tasks} × ${flags.agent}/${flags.mode}${flags.models.length > 0 ? `, models=[${flags.models.join(", ")}]` : ""})`);
   const items = Array.from({ length: flags.tasks }, (_, index) => ({
     client_key: `trace-${index + 1}`,
     title: `${flags.title ?? "Inspect"} #${index + 1}`,
-    prompt: flags.prompt ?? "Reply with the single word OK and nothing else.",
+    prompt: flags.prompts[index] ?? flags.prompt ?? "Reply with the single word OK and nothing else.",
     agent_kind: flags.agent,
+    ...(flags.models[index] != null ? { model: flags.models[index] } : {}),
     execution_mode: flags.mode,
     parent_task: null,
     dependencies: [],
@@ -283,7 +289,7 @@ try {
   const batchID = delegation.batch.id;
   const taskIDs = delegation.tasks.map((task) => task.id);
   for (const task of delegation.tasks) {
-    line(`task ${task.id.slice(0, 8)} key=${task.clientKey} status=${task.status} workspace=${task.workspaceKind}`);
+    line(`task ${task.id.slice(0, 8)} key=${task.clientKey} status=${task.status} workspace=${task.workspaceKind} model=${task.model ?? "-"}`);
   }
 
   step(6, `monitor (poll every ${flags.pollMs}ms, live events below)`);

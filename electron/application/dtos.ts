@@ -57,6 +57,7 @@ export function childTaskDTO(task: ChildTask): ChildTaskDTO {
     title: task.title,
     status: task.status,
     agentKind: task.agentKind,
+    model: task.model,
     executionMode: task.executionMode,
     workspaceKind: task.workspaceKind,
     sessionID: task.sessionID,
