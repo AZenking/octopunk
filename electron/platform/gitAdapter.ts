@@ -37,7 +37,20 @@ export class GitAdapter implements GitPort {
   }
 
   async inspect(repositoryURL: string): Promise<GitRepositoryState> {
-    const head = (await this.runGit(["-C", repositoryURL, "rev-parse", "HEAD"])).stdout.trim();
+    let head: string;
+    try {
+      head = (await this.runGit(["-C", repositoryURL, "rev-parse", "HEAD"])).stdout.trim();
+    } catch (error) {
+      // An unborn HEAD (fresh `git init`, zero commits) is the common case;
+      // rev-list --count --all still answers "0" there, but fails elsewhere.
+      const commitCount = await this.runGit(["-C", repositoryURL, "rev-list", "--count", "--all"])
+        .then((result) => result.stdout.trim())
+        .catch(() => null);
+      if (commitCount === "0") {
+        throw GitAdapterError.emptyRepository(repositoryURL);
+      }
+      throw error;
+    }
     const status = (await this.runGit(["-C", repositoryURL, "status", "--porcelain"])).stdout;
     const branch = await this.currentBranch(repositoryURL).catch(() => "");
     return {

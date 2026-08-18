@@ -245,6 +245,11 @@ export class GitAdapterError extends Error {
       "The target repository has uncommitted changes; the integration result was not applied.",
     );
   }
+  static emptyRepository(path: string): GitAdapterError {
+    return new GitAdapterError(
+      `The repository has no commits yet (${path}). Create an initial commit first — a TeamRun anchors its baseline on HEAD. 仓库还没有任何提交，请先完成一次初始提交再启动 TeamRun。`,
+    );
+  }
 }
 
 export interface GitPort {
