@@ -6,3 +6,6 @@ release/
 *.log
 .DS_Store
 .vite/
+# 本机工具状态目录(codegraph 索引、ZCode 会话技能软链),不随仓库共享
+.codegraph/
+.zcode/
