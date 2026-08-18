@@ -1,0 +1,258 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@plugin "@tailwindcss/typography";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * OctoPunk design tokens — dark-first developer console.
+ * Slate-tinted neutrals with a blue focus accent (WCAG-friendly OLED dark),
+ * driven entirely through shadcn/ui CSS variables.
+ */
+:root {
+  --radius: 0.625rem;
+  --background: oklch(0.98 0.004 264);
+  --foreground: oklch(0.22 0.014 264);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.22 0.014 264);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.22 0.014 264);
+  --primary: oklch(0.55 0.19 255);
+  --primary-foreground: oklch(0.985 0.005 264);
+  --secondary: oklch(0.955 0.006 264);
+  --secondary-foreground: oklch(0.28 0.014 264);
+  --muted: oklch(0.955 0.006 264);
+  --muted-foreground: oklch(0.5 0.018 264);
+  --accent: oklch(0.94 0.008 264);
+  --accent-foreground: oklch(0.22 0.014 264);
+  --destructive: oklch(0.55 0.21 25);
+  --destructive-foreground: oklch(0.985 0.005 264);
+  --border: oklch(0.22 0.014 264 / 12%);
+  --input: oklch(0.22 0.014 264 / 16%);
+  --ring: oklch(0.55 0.19 255);
+  --chart-1: oklch(0.55 0.19 255);
+  --chart-2: oklch(0.55 0.14 163);
+  --chart-3: oklch(0.6 0.14 80);
+  --chart-4: oklch(0.5 0.2 305);
+  --chart-5: oklch(0.55 0.19 20);
+  --sidebar: oklch(0.972 0.005 264);
+  --sidebar-foreground: oklch(0.22 0.014 264);
+  --sidebar-primary: oklch(0.55 0.19 255);
+  --sidebar-primary-foreground: oklch(0.985 0.005 264);
+  --sidebar-accent: oklch(0.94 0.008 264);
+  --sidebar-accent-foreground: oklch(0.22 0.014 264);
+  --sidebar-border: oklch(0.22 0.014 264 / 12%);
+  --sidebar-ring: oklch(0.55 0.19 255);
+  --status-running: oklch(0.52 0.15 152);
+  --status-idle: oklch(0.55 0.13 84);
+  --status-error: oklch(0.5 0.2 25);
+  --status-offline: oklch(0.55 0.01 264);
+  --status-info: oklch(0.5 0.17 250);
+  --status-debug: oklch(0.48 0.18 292);
+  --trace-input: oklch(0.5 0.15 250);
+  --trace-model: oklch(0.48 0.18 292);
+  --trace-tool: oklch(0.55 0.14 62);
+  --scrollbar-thumb: oklch(0.22 0.014 264 / 25%);
+  --scrollbar-thumb-hover: oklch(0.22 0.014 264 / 42%);
+}
+
+.dark {
+  --radius: 0.625rem;
+  --background: oklch(0.155 0.014 264);
+  --foreground: oklch(0.955 0.005 264);
+  --card: oklch(0.195 0.016 264);
+  --card-foreground: oklch(0.955 0.005 264);
+  --popover: oklch(0.215 0.017 264);
+  --popover-foreground: oklch(0.955 0.005 264);
+  --primary: oklch(0.66 0.185 255);
+  --primary-foreground: oklch(0.985 0.005 264);
+  --secondary: oklch(0.26 0.018 264);
+  --secondary-foreground: oklch(0.955 0.005 264);
+  --muted: oklch(0.245 0.016 264);
+  --muted-foreground: oklch(0.71 0.018 264);
+  --accent: oklch(0.28 0.022 264);
+  --accent-foreground: oklch(0.975 0.005 264);
+  --destructive: oklch(0.63 0.2 25);
+  --destructive-foreground: oklch(0.985 0.005 264);
+  --border: oklch(1 0 0 / 9%);
+  --input: oklch(1 0 0 / 13%);
+  --ring: oklch(0.66 0.185 255);
+  --chart-1: oklch(0.66 0.185 255);
+  --chart-2: oklch(0.72 0.15 163);
+  --chart-3: oklch(0.78 0.16 80);
+  --chart-4: oklch(0.62 0.21 305);
+  --chart-5: oklch(0.68 0.19 20);
+  --sidebar: oklch(0.175 0.015 264);
+  --sidebar-foreground: oklch(0.955 0.005 264);
+  --sidebar-primary: oklch(0.66 0.185 255);
+  --sidebar-primary-foreground: oklch(0.985 0.005 264);
+  --sidebar-accent: oklch(0.26 0.02 264);
+  --sidebar-accent-foreground: oklch(0.975 0.005 264);
+  --sidebar-border: oklch(1 0 0 / 9%);
+  --sidebar-ring: oklch(0.66 0.185 255);
+  --status-running: oklch(0.72 0.17 152);
+  --status-idle: oklch(0.79 0.15 84);
+  --status-error: oklch(0.62 0.22 25);
+  --status-offline: oklch(0.7 0 0);
+  --status-info: oklch(0.68 0.15 240);
+  --status-debug: oklch(0.7 0.16 292);
+  --trace-input: oklch(0.62 0.16 250);
+  --trace-model: oklch(0.6 0.19 292);
+  --trace-tool: oklch(0.72 0.16 62);
+  --scrollbar-thumb: oklch(0.955 0.005 264 / 22%);
+  --scrollbar-thumb-hover: oklch(0.955 0.005 264 / 38%);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-status-running: var(--status-running);
+  --color-status-idle: var(--status-idle);
+  --color-status-error: var(--status-error);
+  --color-status-offline: var(--status-offline);
+  --color-trace-input: var(--trace-input);
+  --color-trace-model: var(--trace-model);
+  --color-trace-tool: var(--trace-tool);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  /* Fine dot grid over the main working area; invisible over cards. */
+  .console-grid {
+    background-image: radial-gradient(
+      color-mix(in oklch, var(--foreground) 5%, transparent) 1px,
+      transparent 1px
+    );
+    background-size: 22px 22px;
+  }
+
+  /* shiki blocks: the container owns background/padding; keep token colors. */
+  /* Dual-theme shiki: vars emitted per token; pick by html.dark. */
+  .shiki,
+  .shiki span {
+    color: var(--shiki-light);
+  }
+  .dark .shiki,
+  .dark .shiki span {
+    color: var(--shiki-dark);
+  }
+  pre.shiki {
+    background-color: transparent !important;
+    padding: 0 !important;
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  pre.shiki code {
+    display: block;
+  }
+  pre.shiki .line {
+    padding: 0 1rem;
+  }
+}
+/*
+ ---break---
+ */
+:root {
+  --sidebar: hsl(0 0% 98%);
+  --sidebar-foreground: hsl(240 5.3% 26.1%);
+  --sidebar-primary: hsl(240 5.9% 10%);
+  --sidebar-primary-foreground: hsl(0 0% 98%);
+  --sidebar-accent: hsl(240 4.8% 95.9%);
+  --sidebar-accent-foreground: hsl(240 5.9% 10%);
+  --sidebar-border: hsl(220 13% 91%);
+  --sidebar-ring: hsl(217.2 91.2% 59.8%);
+}
+/*
+ ---break---
+ */
+.dark {
+  --sidebar: hsl(240 5.9% 10%);
+  --sidebar-foreground: hsl(240 4.8% 95.9%);
+  --sidebar-primary: hsl(224.3 76.3% 48%);
+  --sidebar-primary-foreground: hsl(0 0% 100%);
+  --sidebar-accent: hsl(240 3.7% 15.9%);
+  --sidebar-accent-foreground: hsl(240 4.8% 95.9%);
+  --sidebar-border: hsl(240 3.7% 15.9%);
+  --sidebar-ring: hsl(217.2 91.2% 59.8%);
+}
+
+/*
+ * Frameless window (titleBarStyle: hidden): regions that move the window and
+ * the opt-outs for interactive elements rendered inside them.
+ */
+.app-drag {
+  -webkit-app-region: drag;
+}
+.app-no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/*
+ * Slim themed scrollbars: rounded translucent thumb on a transparent track,
+ * tinted per light/dark theme instead of the system default.
+ */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border: 3px solid transparent;
+  border-radius: 9999px;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
