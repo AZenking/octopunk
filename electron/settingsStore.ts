@@ -64,9 +64,18 @@ export class SettingsStore {
 export const CLAUDE_EXECUTABLE_KEY = "OctoPunk.claudeExecutable";
 export const LEGACY_CLAUDE_EXECUTABLE_KEY = "RelayDesk.claudeExecutable";
 export const CODEX_EXECUTABLE_KEY = "OctoPunk.codexExecutable";
+export const PI_EXECUTABLE_KEY = "OctoPunk.piExecutable";
 /** Host-wide custom instructions prepended to every child agent prompt (AGENTS.md-style global guidance). */
 export const CUSTOM_INSTRUCTIONS_KEY = "OctoPunk.customInstructions";
 /** Agent kinds hidden from delegation UI, stored as a JSON string array. */
 export const DISABLED_AGENTS_KEY = "OctoPunk.disabledAgents";
 /** Max concurrent child-agent tasks per TeamRun (Settings → General), as a decimal string. */
 export const MAX_CONCURRENT_TASKS_KEY = "OctoPunk.maxConcurrentTasks";
+/** Automatic retry budget for transient child-agent failures (0 disables), as a decimal string. */
+export const TASK_RETRY_LIMIT_KEY = "OctoPunk.taskRetryLimit";
+/** Minimum seconds between consecutive child launches (0 disables pacing), as a decimal string. */
+export const LAUNCH_STAGGER_SECONDS_KEY = "OctoPunk.launchStaggerSeconds";
+/** Per-agent child model overrides (empty = the agent's own default). */
+export const CLAUDE_CHILD_MODEL_KEY = "OctoPunk.claudeChildModel";
+export const CODEX_CHILD_MODEL_KEY = "OctoPunk.codexChildModel";
+export const PI_CHILD_MODEL_KEY = "OctoPunk.piChildModel";

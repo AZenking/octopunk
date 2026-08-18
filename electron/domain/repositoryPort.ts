@@ -201,7 +201,14 @@ export interface TeamRunRepository {
   requestRework(input: ReviewDecisionInput): Promise<ChildTask>;
   acceptTask(input: ReviewDecisionInput): Promise<ChildTask>;
   blockTask(input: ReviewDecisionInput): Promise<ChildTask>;
-  failTask(input: { requestID: string; runID: string; taskID: string; summary: string }): Promise<ChildTask>;
+  failTask(input: {
+    requestID: string;
+    runID: string;
+    taskID: string;
+    summary: string;
+    /** False when an automatic retry is pending: keep the run draining siblings. */
+    blockRun?: boolean;
+  }): Promise<ChildTask>;
   resumeTask(input: { requestID: string; runID: string; taskID: string }): Promise<ChildTask>;
   cancelTask(input: { requestID: string; runID: string; taskID: string }): Promise<ChildTask>;
   completeTeam(input: {

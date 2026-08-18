@@ -18,7 +18,11 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Switch } from "@/components/ui/switch";
-import { MAX_CONCURRENT_TASKS_LIMIT } from "../../../../shared/ipc";
+import {
+  LAUNCH_STAGGER_SECONDS_MAX,
+  MAX_CONCURRENT_TASKS_LIMIT,
+  TASK_RETRY_LIMIT_MAX,
+} from "../../../../shared/ipc";
 import { Row, RowGroup, SectionLabel, formatBytes } from "@/features/settings/parts";
 import { cn } from "@/lib/utils";
 
@@ -134,6 +138,52 @@ export function GeneralSettings() {
                 }}
                 className="w-20 text-center font-mono"
                 aria-label="并发限制"
+              />
+            }
+          />
+          <Row
+            title="自动重试"
+            desc="限流/超时等瞬时失败自动重试"
+            hint="对限流（529/429）、超时、协议错误按 5s→15s→45s 指数退避自动重试；认证、配置类错误不重试。0 = 关闭。"
+            control={
+              <Input
+                type="number"
+                min={0}
+                max={TASK_RETRY_LIMIT_MAX}
+                value={appState.executionPolicy.taskRetryLimit}
+                onChange={(event) => {
+                  const value = Number.parseInt(event.target.value, 10);
+                  if (Number.isFinite(value)) {
+                    appState.updateExecutionPolicy({
+                      taskRetryLimit: Math.min(TASK_RETRY_LIMIT_MAX, Math.max(0, value)),
+                    });
+                  }
+                }}
+                className="w-20 text-center font-mono"
+                aria-label="自动重试次数"
+              />
+            }
+          />
+          <Row
+            title="启动间隔"
+            desc="批次内子 Agent 错峰拉起"
+            hint="相邻两个子进程启动的最小间隔秒数，避免批次同时打到模型端点触发并发限制。0 = 不间隔。"
+            control={
+              <Input
+                type="number"
+                min={0}
+                max={LAUNCH_STAGGER_SECONDS_MAX}
+                value={appState.executionPolicy.launchStaggerSeconds}
+                onChange={(event) => {
+                  const value = Number.parseInt(event.target.value, 10);
+                  if (Number.isFinite(value)) {
+                    appState.updateExecutionPolicy({
+                      launchStaggerSeconds: Math.min(LAUNCH_STAGGER_SECONDS_MAX, Math.max(0, value)),
+                    });
+                  }
+                }}
+                className="w-20 text-center font-mono"
+                aria-label="启动间隔秒数"
               />
             }
           />

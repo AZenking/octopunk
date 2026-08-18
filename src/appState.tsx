@@ -18,8 +18,10 @@ import type {
 } from "../shared/dtos";
 import type {
   AvailabilityPayload,
+  ChildModelsPayload,
   DelegateTaskItemPayload,
   ExecutablesPayload,
+  ExecutionPolicyPayload,
   GitInspectResult,
   MaxConcurrentTasksPayload,
   SkillInstallResultPayload,
@@ -27,11 +29,15 @@ import type {
   StartTeamResult,
 } from "../shared/ipc";
 import {
+  clampLaunchStaggerSeconds,
+  clampTaskRetryLimit,
+  DEFAULT_LAUNCH_STAGGER_SECONDS,
   DEFAULT_MAX_CONCURRENT_TASKS,
+  DEFAULT_TASK_RETRY_LIMIT,
   MAX_CONCURRENT_TASKS_LIMIT,
 } from "../shared/ipc";
 
-export type ChildAgentKindValue = "claude_code" | "codex";
+export type ChildAgentKindValue = "claude_code" | "codex" | "pi";
 export type TaskExecutionModeValue = "read_only" | "workspace_write";
 
 export interface AppStateValue {
@@ -63,11 +69,20 @@ export interface AppStateValue {
   setAgentEnabled: (kind: ChildAgentKindValue, enabled: boolean) => void;
   childExecutionMode: TaskExecutionModeValue;
   setChildExecutionMode: (value: TaskExecutionModeValue) => void;
+  /** Per-task model override applied to the next delegation ("" = per-kind setting). */
+  childModelOverride: string;
+  setChildModelOverride: (value: string) => void;
   maxReviewRounds: number;
   setMaxReviewRounds: (value: number) => void;
   /** Concurrent child-agent tasks per new TeamRun (persisted in settings.json). */
   maxConcurrentTasks: number;
   setMaxConcurrentTasks: (value: number) => void;
+  /** Settings → 常规: auto-retry budget + launch pacing. */
+  executionPolicy: ExecutionPolicyPayload;
+  updateExecutionPolicy: (patch: Partial<ExecutionPolicyPayload>) => void;
+  /** Settings → 外部 Agent: per-agent child model override ("" = default). */
+  childModels: ChildModelsPayload;
+  setChildModel: (kind: ChildAgentKindValue, model: string) => void;
   isHTTPRunning: boolean;
   migrationMessage: string | null;
   setMigrationMessage: (value: string | null) => void;
@@ -76,6 +91,7 @@ export interface AppStateValue {
   codexBackupPath: string | null;
   claudeAvailability: AvailabilityPayload | null;
   codexAvailability: AvailabilityPayload | null;
+  piAvailability: AvailabilityPayload | null;
   availability: (kind: ChildAgentKindValue) => AvailabilityPayload | null;
   startTeam: () => Promise<void>;
   delegateChildTask: () => Promise<void>;
@@ -86,6 +102,7 @@ export interface AppStateValue {
   archiveRun: (runID: string) => Promise<void>;
   unarchiveRun: (runID: string) => Promise<void>;
   connectCodex: () => Promise<void>;
+  connectPi: () => Promise<void>;
   startHTTPCompatibility: () => Promise<void>;
   stopHTTPCompatibility: () => Promise<void>;
   registerLoginItem: (enabled: boolean) => Promise<void>;
@@ -118,10 +135,16 @@ function uuidPrefix(value: string, length = 8): string {
 }
 
 function isChildAgentKind(value: string): value is ChildAgentKindValue {
-  return value === "claude_code" || value === "codex";
+  return value === "claude_code" || value === "codex" || value === "pi";
 }
 
-const AGENT_KIND_ORDER: ChildAgentKindValue[] = ["claude_code", "codex"];
+const AGENT_KIND_ORDER: ChildAgentKindValue[] = ["claude_code", "codex", "pi"];
+
+function agentKindDisplay(kind: ChildAgentKindValue): string {
+  if (kind === "codex") return "Codex";
+  if (kind === "pi") return "Pi";
+  return "Claude Code";
+}
 
 export function AppStateProvider({ children }: { children: ReactNode }) {
   const [runs, setRuns] = useState<TeamRunSummaryDTO[]>([]);
@@ -141,14 +164,25 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const [childAgentKind, setChildAgentKind] = useState<ChildAgentKindValue>("claude_code");
   const [disabledAgents, setDisabledAgents] = useState<Set<ChildAgentKindValue>>(new Set());
   const [childExecutionMode, setChildExecutionMode] = useState<TaskExecutionModeValue>("workspace_write");
+  const [childModelOverride, setChildModelOverride] = useState("");
   const [maxReviewRounds, setMaxReviewRounds] = useState(5);
   const [maxConcurrentTasks, setMaxConcurrentTasksState] = useState(DEFAULT_MAX_CONCURRENT_TASKS);
+  const [executionPolicy, setExecutionPolicyState] = useState<ExecutionPolicyPayload>({
+    taskRetryLimit: DEFAULT_TASK_RETRY_LIMIT,
+    launchStaggerSeconds: DEFAULT_LAUNCH_STAGGER_SECONDS,
+  });
+  const [childModels, setChildModelsState] = useState<ChildModelsPayload>({
+    claudeModel: "",
+    codexModel: "",
+    piModel: "",
+  });
   const [isHTTPRunning, setIsHTTPRunning] = useState(false);
   const [migrationMessage, setMigrationMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [codexBackupPath, setCodexBackupPath] = useState<string | null>(null);
   const [claudeAvailability, setClaudeAvailability] = useState<AvailabilityPayload | null>(null);
   const [codexAvailability, setCodexAvailability] = useState<AvailabilityPayload | null>(null);
+  const [piAvailability, setPiAvailability] = useState<AvailabilityPayload | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [skillStatus, setSkillStatus] = useState<SkillInstallStatusPayload[]>([]);
   const bootstrapped = useRef(false);
@@ -189,12 +223,14 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       // Availability refresh below still runs.
     }
     try {
-      const [claude, codex] = await Promise.all([
+      const [claude, codex, pi] = await Promise.all([
         window.octopunk.invoke<AvailabilityPayload>("agent:check", { kind: "claude_code" }),
         window.octopunk.invoke<AvailabilityPayload>("agent:check", { kind: "codex" }),
+        window.octopunk.invoke<AvailabilityPayload>("agent:check", { kind: "pi" }),
       ]);
       setClaudeAvailability(claude);
       setCodexAvailability(codex);
+      setPiAvailability(pi);
     } catch {
       // Manual refresh stays as the fallback path.
     }
@@ -217,12 +253,14 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         return;
       }
       try {
-        const [claude, codex] = await Promise.all([
+        const [claude, codex, pi] = await Promise.all([
           window.octopunk.invoke<AvailabilityPayload>("agent:check", { kind: "claude_code" }),
           window.octopunk.invoke<AvailabilityPayload>("agent:check", { kind: "codex" }),
+          window.octopunk.invoke<AvailabilityPayload>("agent:check", { kind: "pi" }),
         ]);
         setClaudeAvailability(claude);
         setCodexAvailability(codex);
+        setPiAvailability(pi);
       } catch {
         // Availability stays unknown; Settings can re-check.
       }
@@ -243,6 +281,20 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         setMaxConcurrentTasksState(result.maxConcurrentTasks);
       } catch {
         // Concurrency stays at the default; Settings can rewrite the value.
+      }
+      try {
+        setExecutionPolicyState(
+          await window.octopunk.invoke<ExecutionPolicyPayload>("settings:get-execution-policy"),
+        );
+      } catch {
+        // Policy stays at the defaults; Settings can rewrite the values.
+      }
+      try {
+        setChildModelsState(
+          await window.octopunk.invoke<ChildModelsPayload>("settings:get-child-models"),
+        );
+      } catch {
+        // Model overrides stay empty; Settings can rewrite them.
       }
       try {
         setSkillStatus(
@@ -294,6 +346,42 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       });
   }, []);
 
+  const updateExecutionPolicy = useCallback(
+    (patch: Partial<ExecutionPolicyPayload>): void => {
+      const next: ExecutionPolicyPayload = {
+        taskRetryLimit: clampTaskRetryLimit(patch.taskRetryLimit ?? executionPolicy.taskRetryLimit),
+        launchStaggerSeconds: clampLaunchStaggerSeconds(
+          patch.launchStaggerSeconds ?? executionPolicy.launchStaggerSeconds,
+        ),
+      };
+      setExecutionPolicyState(next);
+      void window.octopunk
+        .invoke<ExecutionPolicyPayload>("settings:set-execution-policy", next)
+        .then((result) => {
+          setExecutionPolicyState(result);
+        })
+        .catch((error) => {
+          setErrorMessage(error instanceof Error ? error.message : String(error));
+        });
+    },
+    [executionPolicy],
+  );
+
+  const setChildModel = useCallback((kind: ChildAgentKindValue, model: string): void => {
+    setChildModelsState((current) => ({
+      ...current,
+      [kind === "claude_code" ? "claudeModel" : kind === "pi" ? "piModel" : "codexModel"]: model,
+    }));
+    void window.octopunk
+      .invoke<ChildModelsPayload>("settings:set-child-model", { kind, model })
+      .then((result) => {
+        setChildModelsState(result);
+      })
+      .catch((error) => {
+        setErrorMessage(error instanceof Error ? error.message : String(error));
+      });
+  }, []);
+
   // Keep the delegation selection on an enabled kind when agents get disabled.
   useEffect(() => {
     if (!disabledAgents.has(childAgentKind)) return;
@@ -337,8 +425,12 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
 
   const availability = useCallback(
     (kind: ChildAgentKindValue): AvailabilityPayload | null =>
-      kind === "claude_code" ? claudeAvailability : codexAvailability,
-    [claudeAvailability, codexAvailability],
+      kind === "claude_code"
+        ? claudeAvailability
+        : kind === "pi"
+          ? piAvailability
+          : codexAvailability,
+    [claudeAvailability, codexAvailability, piAvailability],
   );
 
   const startTeam = useCallback(async () => {
@@ -368,12 +460,12 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const delegateChildTask = useCallback(async () => {
     if (selectedRunID == null) return;
     if (disabledAgents.has(childAgentKind)) {
-      const display = childAgentKind === "codex" ? "Codex" : "Claude Code";
+      const display = agentKindDisplay(childAgentKind);
       setErrorMessage(`${display} is disabled. Enable it in Settings before delegating.`);
       return;
     }
     if (availability(childAgentKind)?.isAvailable !== true) {
-      const display = childAgentKind === "codex" ? "Codex" : "Claude Code";
+      const display = agentKindDisplay(childAgentKind);
       setErrorMessage(
         `${display} is unavailable. Check its executable in Settings before delegating.`,
       );
@@ -385,11 +477,12 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         title: childTitle,
         prompt: childPrompt,
         agentKind: childAgentKind,
+        model: childModelOverride.trim() || null,
         executionMode: childExecutionMode,
       });
       setChildTitle("");
       setChildPrompt("");
-      const display = childAgentKind === "codex" ? "Codex" : "Claude Code";
+      const display = agentKindDisplay(childAgentKind);
       setMigrationMessage(
         `Delegated ${task.title} to ${display} in ${childExecutionMode === "read_only" ? "read only" : "workspace write"} mode.`,
       );
@@ -397,17 +490,17 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     } catch (error) {
       setErrorMessage(errorMessageOf(error));
     }
-  }, [selectedRunID, childTitle, childPrompt, childAgentKind, childExecutionMode, availability, refreshSelectedRun, disabledAgents]);
+  }, [selectedRunID, childTitle, childPrompt, childAgentKind, childModelOverride, childExecutionMode, availability, refreshSelectedRun, disabledAgents]);
 
   const delegateChildBatch = useCallback(async () => {
     if (selectedRunID == null) return;
     if (disabledAgents.has(childAgentKind)) {
-      const display = childAgentKind === "codex" ? "Codex" : "Claude Code";
+      const display = agentKindDisplay(childAgentKind);
       setErrorMessage(`${display} is disabled. Enable it in Settings before delegating.`);
       return;
     }
     if (availability(childAgentKind)?.isAvailable !== true) {
-      const display = childAgentKind === "codex" ? "Codex" : "Claude Code";
+      const display = agentKindDisplay(childAgentKind);
       setErrorMessage(
         `${display} is unavailable. Check its executable in Settings before delegating.`,
       );
@@ -454,6 +547,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         title,
         prompt,
         agentKind: childAgentKind,
+        model: childModelOverride.trim() || null,
         executionMode: childExecutionMode,
         parentTask: taskParent,
         dependencies: taskDependencies,
@@ -488,6 +582,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     childDependencyIDs,
     childAgentKind,
     childExecutionMode,
+    childModelOverride,
     availability,
     refreshSelectedRun,
     disabledAgents,
@@ -552,6 +647,19 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const connectPi = useCallback(async () => {
+    try {
+      const result = await window.octopunk.invoke<{ backupPath: string | null }>("settings:connect-pi");
+      setStatusMessage(
+        `已写入 ~/.pi/agent/mcp.json（octopunk · stdio · eager）${
+          result.backupPath != null ? "；原文件已自动备份。" : ""
+        }需先安装 pi-mcp-extension（pi install npm:pi-mcp-extension）。`,
+      );
+    } catch (error) {
+      setErrorMessage(errorMessageOf(error));
+    }
+  }, []);
+
   const startHTTPCompatibility = useCallback(async () => {
     try {
       const result = await window.octopunk.invoke<{ endpoint: string }>("http:start");
@@ -586,7 +694,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         "settings:install-skill",
         { kind },
       );
-      const display = kind === "codex" ? "Codex" : "Claude Code";
+      const display = agentKindDisplay(kind);
       setSkillStatus(
         await window.octopunk.invoke<SkillInstallStatusPayload[]>("settings:get-skill-status"),
       );
@@ -608,6 +716,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       });
       if (kind === "claude_code") {
         setClaudeAvailability(result);
+      } else if (kind === "pi") {
+        setPiAvailability(result);
       } else {
         setCodexAvailability(result);
       }
@@ -672,10 +782,16 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       setAgentEnabled,
       childExecutionMode,
       setChildExecutionMode,
+      childModelOverride,
+      setChildModelOverride,
       maxReviewRounds,
       setMaxReviewRounds,
       maxConcurrentTasks,
       setMaxConcurrentTasks,
+      executionPolicy,
+      updateExecutionPolicy,
+      childModels,
+      setChildModel,
       isHTTPRunning,
       migrationMessage,
       setMigrationMessage,
@@ -684,6 +800,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       codexBackupPath,
       claudeAvailability,
       codexAvailability,
+      piAvailability,
       availability,
       startTeam,
       delegateChildTask,
@@ -694,6 +811,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       archiveRun,
       unarchiveRun,
       connectCodex,
+      connectPi,
       startHTTPCompatibility,
       stopHTTPCompatibility,
       registerLoginItem,
@@ -723,15 +841,21 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       disabledAgents,
       setAgentEnabled,
       childExecutionMode,
+      childModelOverride,
       maxReviewRounds,
       maxConcurrentTasks,
       setMaxConcurrentTasks,
+      executionPolicy,
+      updateExecutionPolicy,
+      childModels,
+      setChildModel,
       isHTTPRunning,
       migrationMessage,
       errorMessage,
       codexBackupPath,
       claudeAvailability,
       codexAvailability,
+      piAvailability,
       availability,
       startTeam,
       delegateChildTask,
@@ -742,6 +866,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       archiveRun,
       unarchiveRun,
       connectCodex,
+      connectPi,
       startHTTPCompatibility,
       stopHTTPCompatibility,
       registerLoginItem,

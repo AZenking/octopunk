@@ -5,13 +5,29 @@
 import { randomUUID } from "node:crypto";
 import { BrowserWindow, dialog, ipcMain } from "electron";
 import type { AppEnvironment } from "./appEnvironment";
-import { CLAUDE_EXECUTABLE_KEY, CODEX_EXECUTABLE_KEY, CUSTOM_INSTRUCTIONS_KEY, DISABLED_AGENTS_KEY, MAX_CONCURRENT_TASKS_KEY } from "./settingsStore";
+import {
+  CLAUDE_CHILD_MODEL_KEY,
+  CLAUDE_EXECUTABLE_KEY,
+  CODEX_CHILD_MODEL_KEY,
+  CODEX_EXECUTABLE_KEY,
+  CUSTOM_INSTRUCTIONS_KEY,
+  DISABLED_AGENTS_KEY,
+  LAUNCH_STAGGER_SECONDS_KEY,
+  MAX_CONCURRENT_TASKS_KEY,
+  PI_CHILD_MODEL_KEY,
+  PI_EXECUTABLE_KEY,
+  TASK_RETRY_LIMIT_KEY,
+} from "./settingsStore";
 import type { AsyncStream } from "./domain/repositoryPort";
 import {
+  clampLaunchStaggerSeconds,
+  clampTaskRetryLimit,
   DEFAULT_MAX_CONCURRENT_TASKS,
   MAX_CONCURRENT_TASKS_LIMIT,
   type AvailabilityPayload,
+  type ChildModelsPayload,
   type DelegateTaskItemPayload,
+  type ExecutionPolicyPayload,
   type MaxConcurrentTasksPayload,
 } from "../shared/ipc";
 
@@ -289,10 +305,53 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
     return { maxConcurrentTasks: value };
   });
 
+  handle("settings:get-execution-policy", (): ExecutionPolicyPayload => ({
+    taskRetryLimit: clampTaskRetryLimit(environment.settings.string(TASK_RETRY_LIMIT_KEY)),
+    launchStaggerSeconds: clampLaunchStaggerSeconds(
+      environment.settings.string(LAUNCH_STAGGER_SECONDS_KEY),
+    ),
+  }));
+
+  handle("settings:set-execution-policy", (payload): ExecutionPolicyPayload => {
+    const request = payload as { taskRetryLimit?: unknown; launchStaggerSeconds?: unknown };
+    const taskRetryLimit = clampTaskRetryLimit(request.taskRetryLimit);
+    const launchStaggerSeconds = clampLaunchStaggerSeconds(request.launchStaggerSeconds);
+    environment.settings.set(TASK_RETRY_LIMIT_KEY, String(taskRetryLimit));
+    environment.settings.set(LAUNCH_STAGGER_SECONDS_KEY, String(launchStaggerSeconds));
+    return { taskRetryLimit, launchStaggerSeconds };
+  });
+
+  handle("settings:get-child-models", (): ChildModelsPayload => ({
+    claudeModel: environment.settings.string(CLAUDE_CHILD_MODEL_KEY) ?? "",
+    codexModel: environment.settings.string(CODEX_CHILD_MODEL_KEY) ?? "",
+    piModel: environment.settings.string(PI_CHILD_MODEL_KEY) ?? "",
+  }));
+
+  handle("settings:set-child-model", (payload): ChildModelsPayload => {
+    const request = payload as { kind?: "claude_code" | "codex" | "pi"; model?: string };
+    // Empty model clears the override (SettingsStore.string treats "" as unset).
+    const model = (request.model ?? "").trim().slice(0, 100);
+    if (request.kind === "claude_code" || request.kind === "codex" || request.kind === "pi") {
+      environment.settings.set(
+        request.kind === "claude_code"
+          ? CLAUDE_CHILD_MODEL_KEY
+          : request.kind === "pi"
+            ? PI_CHILD_MODEL_KEY
+            : CODEX_CHILD_MODEL_KEY,
+        model,
+      );
+    }
+    return {
+      claudeModel: environment.settings.string(CLAUDE_CHILD_MODEL_KEY) ?? "",
+      codexModel: environment.settings.string(CODEX_CHILD_MODEL_KEY) ?? "",
+      piModel: environment.settings.string(PI_CHILD_MODEL_KEY) ?? "",
+    };
+  });
+
   handle("settings:get-skill-status", () => environment.skillInstaller.status());
 
   handle("settings:install-skill", (payload) => {
-    const request = payload as { kind: "claude_code" | "codex" };
+    const request = payload as { kind: "claude_code" | "codex" | "pi" };
     return environment.skillInstaller.install(request.kind);
   });
 

@@ -15,6 +15,7 @@ import { TaskEventHub } from "../domain/events";
 import type { TaskEventUpdate } from "../domain/events";
 import {
   ChildAgentDiagnostics,
+  ChildAgentExecutionError,
   CancellationError,
   type ChildAgentKind,
 } from "./ports";
@@ -43,6 +44,17 @@ import type { TaskIntegrationService } from "./taskIntegrationService";
 interface ChildWork {
   controller: AbortController;
   done: Promise<void>;
+}
+
+/** Settings → 常规 (General): automatic retry + launch pacing, read per use. */
+export interface ExecutionPolicy {
+  taskRetryLimit: number;
+  launchStaggerSeconds: number;
+}
+
+/** Exponential backoff between automatic retries: 5s, 15s, 45s… capped at 60s. */
+export function retryBackoffMs(retryIndex: number): number {
+  return Math.min(60_000, 5_000 * Math.pow(3, Math.max(0, retryIndex)));
 }
 
 /**
@@ -77,21 +89,28 @@ export class AgentTeamApplicationService {
   private readonly childExecution: ChildExecutionService;
   private readonly integration: TaskIntegrationService;
   private readonly eventHub: TaskEventHub | null;
+  private readonly executionPolicy?: () => ExecutionPolicy | null;
   private childWork = new Map<string, ChildWork>();
   /** Includes a reservation while `launch` is awaiting the database write. */
   private childRunIDs = new Map<string, string>();
   private eventMonitors = new Map<string, { cancel: () => void }>();
+  /** Automatic retries consumed per task; cleared on the first success. */
+  private retryCounts = new Map<string, number>();
+  /** Instance-wide launch pacer: enforces the stagger interval across runs. */
+  private lastLaunchAt = 0;
 
   constructor(input: {
     repository: TeamRunRepository;
     childExecution: ChildExecutionService;
     integration: TaskIntegrationService;
     eventHub?: TaskEventHub | null;
+    executionPolicy?: () => ExecutionPolicy | null;
   }) {
     this.repository = input.repository;
     this.childExecution = input.childExecution;
     this.integration = input.integration;
     this.eventHub = input.eventHub ?? null;
+    this.executionPolicy = input.executionPolicy;
   }
 
   async startTeam(input: StartTeamInput): Promise<import("../../shared/dtos").TeamStatusDTO> {
@@ -413,6 +432,14 @@ export class AgentTeamApplicationService {
       });
       if (!ready) continue;
       if (!(this.activeChildCount(runID) < snapshot.run.maxConcurrentTasks)) break;
+      const waitedMs = await this.paceNextLaunch();
+      if (waitedMs > 0) {
+        // The run's state may have changed while pacing (e.g. a sibling task
+        // failed and blocked the queue, or the run was cancelled).
+        const current = await this.repository.snapshot(runID);
+        if (runStatusIsTerminal(current.run.status)) return;
+        if (!(this.activeChildCount(runID) < current.run.maxConcurrentTasks)) break;
+      }
       const preparedTask = await this.prepareBaselineIfNeeded(
         task,
         snapshot.run,
@@ -421,6 +448,24 @@ export class AgentTeamApplicationService {
       );
       await this.launch(preparedTask, snapshot.run);
     }
+  }
+
+  /**
+   * Staggers consecutive child launches by the configured interval so a batch
+   * does not hit the model endpoint simultaneously (GLM/Anthropic 429/529).
+   * Returns the time actually waited; 0 when pacing is disabled.
+   */
+  private async paceNextLaunch(): Promise<number> {
+    const staggerSeconds = this.executionPolicy?.()?.launchStaggerSeconds ?? 0;
+    if (staggerSeconds <= 0) return 0;
+    const waitMs = Math.max(0, this.lastLaunchAt + staggerSeconds * 1000 - Date.now());
+    if (waitMs > 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, waitMs).unref?.();
+      });
+    }
+    this.lastLaunchAt = Date.now();
+    return waitMs;
   }
 
   /**
@@ -556,6 +601,7 @@ export class AgentTeamApplicationService {
             diffSummary: report.diffSummary,
             blocker: report.blocker,
           });
+          this.retryCounts.delete(taskID);
           await this.removeWork(taskID, startedTask.runID);
         } catch (error) {
           if (error instanceof CancellationError || controller.signal.aborted) {
@@ -563,13 +609,20 @@ export class AgentTeamApplicationService {
             return;
           }
           const message = error instanceof Error ? error.message : String(error);
+          const retry = this.planAutomaticRetry(taskID, error);
+          const eventMessage =
+            retry != null
+              ? `${ChildAgentDiagnostics.redact(message, 512)} · ${Math.round(
+                  retry.delayMs / 1000,
+                )}s 后自动重试（第 ${retry.attempt}/${retry.limit} 次）`
+              : ChildAgentDiagnostics.redact(message, 512);
           await repository
             .recordTaskExecutionEvent({
               runID: startedTask.runID,
               taskID,
               event: {
                 kind: "failed",
-                message: ChildAgentDiagnostics.redact(message, 512),
+                message: eventMessage,
               },
             })
             .catch(() => {});
@@ -579,9 +632,15 @@ export class AgentTeamApplicationService {
               runID: startedTask.runID,
               taskID,
               summary: message,
+              // A pending automatic retry must not freeze the run's queue;
+              // only exhausted (terminal) failures block it.
+              blockRun: retry == null,
             })
             .catch(() => {});
           await this.removeWork(taskID, startedTask.runID);
+          if (retry != null) {
+            this.scheduleRetry(taskID, startedTask.runID, retry);
+          }
         }
       })();
       this.childWork.set(task.id, { controller, done });
@@ -596,6 +655,71 @@ export class AgentTeamApplicationService {
     this.childWork.delete(taskID);
     this.childRunIDs.delete(taskID);
     await this.launchReadyTasks(runID).catch(() => {});
+  }
+
+  /**
+   * Decides whether a failure earns an automatic retry: only transient
+   * provider/transport errors (rate limits, timeouts, protocol glitches) and
+   * only while the attempt budget from Settings lasts.
+   */
+  private planAutomaticRetry(
+    taskID: string,
+    error: unknown,
+  ): { attempt: number; limit: number; delayMs: number } | null {
+    const limit = this.executionPolicy?.()?.taskRetryLimit ?? 0;
+    if (limit <= 0) return null;
+    if (!(error instanceof ChildAgentExecutionError)) return null;
+    if (!ChildAgentDiagnostics.isRetryable(error.failureKind)) return null;
+    const attempt = (this.retryCounts.get(taskID) ?? 0) + 1;
+    if (attempt > limit) return null;
+    this.retryCounts.set(taskID, attempt);
+    return { attempt, limit, delayMs: retryBackoffMs(attempt - 1) };
+  }
+
+  /**
+   * Re-queues a failed task after its backoff delay. While a retry is
+   * pending the run stays unblocked (failTask with blockRun:false), so
+   * siblings keep draining; at expiry, resumeTask flips the task back to
+   * queued/rework_required and the task is launched DIRECTLY: a sibling's
+   * terminal failure may have re-blocked the run during the pacing wait,
+   * and the generic queue drain treats blocked as terminal. The guards
+   * keep cancelled/discarded/teardown-failed runs dead.
+   */
+  private scheduleRetry(
+    taskID: string,
+    runID: string,
+    retry: { attempt: number; delayMs: number },
+  ): void {
+    setTimeout(() => {
+      void (async () => {
+        try {
+          const before = await this.repository.snapshot(runID);
+          if (
+            before.run.status === "completed" ||
+            before.run.status === "cancelled" ||
+            before.run.status === "failed"
+          ) {
+            return;
+          }
+          const failed = before.tasks.find((candidate) => candidate.id === taskID);
+          if (failed == null || failed.status !== "failed") return;
+          await this.repository.resumeTask({
+            requestID: `auto-retry:${taskID}:${retry.attempt}`,
+            runID,
+            taskID,
+          });
+          const snapshot = await this.repository.snapshot(runID);
+          const task = snapshot.tasks.find((candidate) => candidate.id === taskID);
+          if (task == null || (task.status !== "queued" && task.status !== "rework_required")) return;
+          if (this.childRunIDs.has(task.id)) return;
+          await this.paceNextLaunch();
+          await this.launch(task, snapshot.run);
+          await this.launchReadyTasks(runID);
+        } catch {
+          // Manual resume from the GUI / resume_task MCP tool remains available.
+        }
+      })();
+    }, retry.delayMs).unref?.();
   }
 
   private activeChildCount(runID: string): number {

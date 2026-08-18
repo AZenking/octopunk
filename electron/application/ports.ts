@@ -54,6 +54,8 @@ export interface ChildAgentEnvironment {
   allowNetwork: boolean;
   allowedTools: string[];
   contextServer: OctoPunkContextServerBinding | null;
+  /** Settings → 子 Agent 模型 override; null keeps the agent's own default. */
+  childModel: string | null;
 }
 
 export function makeChildAgentEnvironment(init: {
@@ -65,6 +67,7 @@ export function makeChildAgentEnvironment(init: {
   allowNetwork?: boolean;
   allowedTools?: string[] | null;
   contextServer?: OctoPunkContextServerBinding | null;
+  childModel?: string | null;
 }): ChildAgentEnvironment {
   const executionMode = init.executionMode ?? "workspace_write";
   return {
@@ -76,6 +79,7 @@ export function makeChildAgentEnvironment(init: {
     allowNetwork: init.allowNetwork ?? false,
     allowedTools: init.allowedTools ?? toolProfileForExecutionMode(executionMode),
     contextServer: init.contextServer ?? null,
+    childModel: init.childModel ?? null,
   };
 }
 
@@ -139,7 +143,14 @@ export const ChildAgentDiagnostics = {
 
   failureKind(text: string): ChildAgentFailureKind {
     const normalized = text.toLowerCase();
-    if (normalized.includes("529") || normalized.includes("rate limit") || normalized.includes("overloaded")) {
+    if (
+      normalized.includes("529") ||
+      normalized.includes("429") ||
+      normalized.includes("rate limit") ||
+      normalized.includes("too many requests") ||
+      normalized.includes("overloaded") ||
+      normalized.includes("访问量过大")
+    ) {
       return "rate_limited";
     }
     if (normalized.includes("timeout") || normalized.includes("timed out") || normalized.includes("deadline exceeded")) {
@@ -147,6 +158,7 @@ export const ChildAgentDiagnostics = {
     }
     if (
       normalized.includes("not logged") ||
+      normalized.includes("no api key") ||
       normalized.includes("unauthorized") ||
       normalized.includes("authentication") ||
       normalized.includes("login required")
@@ -163,6 +175,15 @@ export const ChildAgentDiagnostics = {
       return "executable";
     }
     return "unknown";
+  },
+
+  /**
+   * Transient provider/transport failures are worth an automatic retry;
+   * configuration, auth, and unknown failures are not (retrying cannot fix
+   * them and burns the attempt budget).
+   */
+  isRetryable(kind: ChildAgentFailureKind): boolean {
+    return kind === "rate_limited" || kind === "timeout" || kind === "protocol_error";
   },
 };
 
@@ -353,12 +374,12 @@ export interface LoginItemPort {
 export type SkillInstallState = "not_installed" | "installed" | "update_available";
 
 export interface SkillInstallStatus {
-  kind: "claude_code" | "codex";
+  kind: "claude_code" | "codex" | "pi";
   state: SkillInstallState;
   path: string;
 }
 
 export interface SkillInstallerPort {
   status(): Promise<SkillInstallStatus[]>;
-  install(kind: "claude_code" | "codex"): Promise<{ path: string; backupPath: string | null }>;
+  install(kind: "claude_code" | "codex" | "pi"): Promise<{ path: string; backupPath: string | null }>;
 }
