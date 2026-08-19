@@ -722,14 +722,21 @@ export class DoctorService {
     };
   }
 
-  /** ⑦ sandbox:sandbox-exec 轻探测;退出码 0 → pass,无命令 → fail(macOS 必备)。 */
+  /** ⑦ sandbox:sandbox-exec 实跑一次最小沙箱;退出码 0 → pass,无命令 → fail(macOS 必备)。 */
   private async checkSandbox(): Promise<Omit<ItemDraft, "durationMs">> {
-    const probe = await this.runCommand("sandbox-exec", ["-p", "(version)"]);
+    // "(version)" 单独传入是非法 profile(退出码 64);合法最小探测 =
+    // 声明版本 + allow default 后在沙箱内执行 /bin/echo(实跑,非仅语法检查)。
+    const probe = await this.runCommand("sandbox-exec", [
+      "-p",
+      "(version 1)(allow default)",
+      "/bin/echo",
+      "ok",
+    ]);
     if (probe.exitCode === 0) {
       return {
         checkKey: "sandbox",
         status: "pass",
-        detail: "sandbox-exec 可用(只读沙箱配置探测退出码 0),离线沙箱执行可用。",
+        detail: "sandbox-exec 可用(最小沙箱内执行命令成功),离线沙箱执行可用。",
         impact: IMPACTS.sandbox,
         suggestion: SUGGESTIONS.sandbox,
       };

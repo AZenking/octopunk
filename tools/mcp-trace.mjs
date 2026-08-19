@@ -57,6 +57,9 @@ const flags = {
   gateSpec: null, // "tests=pnpm test,lint=…" enables the quality-gate scenario (spec 002 场景 2)
   gateFailPath: null, // repo-relative marker path; forces the injected tests check to fail
   gateWaive: false, // waive failing items ("mcp-trace waiver"), re-evaluate, then accept
+  runs: 0, // >0: multi-run scenario — N parallel MCP sessions (spec 001 场景 1)
+  sameRepoSerial: false, // with --runs 2: same repo, second complete_team must be rejected (集成串行化)
+  doctor: false, // run the doctor checkup scenario (spec 001 场景 3) and exit
 };
 
 for (let index = 2; index < process.argv.length; index += 1) {
@@ -82,6 +85,9 @@ for (let index = 2; index < process.argv.length; index += 1) {
     case "--keep": flags.keep = true; break;
     case "--gate": flags.gateSpec = value(); break;
     case "--gate-fail-path": flags.gateFailPath = value(); break;
+    case "--runs": flags.runs = Number.parseInt(value(), 10); break;
+    case "--same-repo-serial": flags.sameRepoSerial = true; break;
+    case "--doctor": flags.doctor = true; break;
     case "--gate-waive": flags.gateWaive = true; break;
     default:
       console.error(`unknown flag: ${arg}`);
@@ -246,7 +252,192 @@ function printGateEvaluation(evaluation) {
   }
 }
 
+// ---------- v0.3 scenarios (T029): doctor / multi-run / same-repo serialization ----------
+
+/** Poll get_team_status until the task reaches awaiting_report or a terminal state. */
+async function awaitTaskReport(server, runID, taskID) {
+  const deadline = Date.now() + flags.maxWaitSecs * 1000;
+  for (;;) {
+    const status = await server.call("get_team_status", { run_id: runID });
+    const task = status.tasks.find((candidate) => candidate.id === taskID);
+    if (
+      task == null ||
+      ["awaiting_report", "rework_required", "accepted", "blocked", "cancelled", "failed"].includes(task.status)
+    ) {
+      return { status, task };
+    }
+    if (Date.now() > deadline) return { status, task: task ?? null };
+    await sleep(flags.pollMs);
+  }
+}
+
+async function doctorScenario() {
+  const tempRepo = makeTempRepo();
+  const server = new McpServer(path.join(tempRepo.dir, "trace.sqlite"));
+  try {
+    step(1, "doctor scenario — run_doctor (throwaway repo + DB)");
+    await server.request("initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "mcp-trace", version: "1" },
+    });
+    server.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    const report = await server.call("run_doctor", {
+      request_id: nextRequestID("doctor"),
+      repository_path: tempRepo.repo,
+      triggered_by: "user",
+    });
+    line(`overall=${report.overall} items=${report.items.length}`);
+    for (const item of report.items) {
+      line(`  ${item.checkKey.padEnd(16)} ${item.status.padEnd(8)} ${brief(item.detail ?? "", 80)}`);
+    }
+    const retryKey = report.items.find((item) => item.status !== "pass")?.checkKey ?? "db_health";
+    step(2, `doctor rerun one item (${retryKey})`);
+    const rerun = await server.call("run_doctor", {
+      request_id: nextRequestID("doctor-rerun"),
+      repository_path: tempRepo.repo,
+      triggered_by: "user",
+    }).catch(() => null);
+    if (rerun != null) line(`re-check overall=${rerun.overall}`);
+    console.log("\nDONE (--doctor)");
+  } finally {
+    server.child.kill("SIGTERM");
+    fs.rmSync(tempRepo.dir, { recursive: true, force: true });
+  }
+  process.exit(0);
+}
+
+async function multiRunScenario() {
+  const count = flags.runs;
+  const sharedDir = fs.mkdtempSync(path.join(os.tmpdir(), "octopunk-trace-multi-"));
+  const databaseURL = path.join(sharedDir, "trace.sqlite");
+  const sharedRepo = flags.sameRepoSerial ? makeTempRepo() : null;
+  const temps = sharedRepo ? [sharedRepo] : [];
+  const sessions = [];
+  try {
+    step(1, `multi-run scenario — ${count} parallel MCP sessions (${flags.sameRepoSerial ? "same repo" : "repo per session"})`);
+    for (let index = 0; index < count; index += 1) {
+      const repoInfo = sharedRepo ?? makeTempRepo();
+      if (!sharedRepo) temps.push(repoInfo);
+      const server = new McpServer(databaseURL);
+      await server.request("initialize", {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "mcp-trace", version: "1" },
+      });
+      server.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      const start = await server.call("start_team", {
+        request_id: nextRequestID(`start-${index}`),
+        repository_path: repoInfo.repo,
+        task: `mcp-trace multi-run #${index + 1}`,
+        baseline_commit: repoInfo.head,
+        target_branch: currentBranch(repoInfo.repo),
+      });
+      const delegated = await server.call("delegate_tasks", {
+        request_id: nextRequestID(`delegate-${index}`),
+        context_summary: "multi-run isolation probe",
+        tasks: [
+          {
+            client_key: `multi-${index}`,
+            title: `Inspect #${index + 1}`,
+            prompt: flags.prompt ?? "Report the repository name you can see and stop.",
+            agent_kind: flags.agent,
+            execution_mode: flags.mode,
+          },
+        ],
+      });
+      sessions.push({ server, repo: repoInfo.repo, runID: start.run.id, taskID: delegated.tasks[0].id, index });
+      line(`session ${index + 1}: run ${start.run.id.slice(0, 8)} task ${delegated.tasks[0].id.slice(0, 8)} baseline=${start.run.baselineCommit.slice(0, 8)}`);
+    }
+
+    step(2, "cross-talk assertion — each session sees only its own run/task");
+    let isolated = true;
+    for (const session of sessions) {
+      const status = await session.server.call("get_team_status", { run_id: session.runID });
+      const foreignTasks = status.tasks.filter((task) => task.id !== session.taskID);
+      const sameBase = status.run.baselineCommit != null;
+      if (foreignTasks.length > 0 || status.run.id !== session.runID || !sameBase) isolated = false;
+      line(`session ${session.index + 1}: tasks=${status.tasks.length} own=${foreignTasks.length === 0 ? "yes" : "NO"}`);
+    }
+    line(isolated ? "PASS: zero cross-talk between parallel runs" : "FAIL: cross-talk detected");
+    if (!isolated) process.exitCode = 1;
+
+    if (!flags.accept) {
+      console.log("\nDONE (--runs, --no-accept)");
+      return;
+    }
+
+    step(3, "await reports in parallel");
+    await Promise.all(sessions.map((session) => awaitTaskReport(session.server, session.runID, session.taskID)));
+    for (const session of sessions) {
+      await session.server.call("accept_task", {
+        request_id: nextRequestID(`accept-${session.index}`),
+        run_id: session.runID,
+        task_id: session.taskID,
+        summary: `mcp-trace multi-run acceptance #${session.index + 1}`,
+      });
+    }
+
+    if (flags.sameRepoSerial && sessions.length === 2) {
+      step(4, "integration serialization — first complete applies, second must be rejected");
+      const first = await sessions[0].server.call("complete_team", {
+        request_id: nextRequestID("complete-0"),
+        run_id: sessions[0].runID,
+        final_verdict: "PASS",
+        summary: "mcp-trace serial first",
+      });
+      line(`first  → run status=${first.run.status} (target branch advanced)`);
+      let rejection = null;
+      try {
+        await sessions[1].server.call("complete_team", {
+          request_id: nextRequestID("complete-1"),
+          run_id: sessions[1].runID,
+          final_verdict: "PASS",
+          summary: "mcp-trace serial second",
+        });
+      } catch (error) {
+        rejection = error instanceof Error ? error.message : String(error);
+      }
+      if (rejection != null && /baseline|target|moved|dirty/i.test(rejection)) {
+        line(`second → REJECTED as expected: ${brief(rejection, 90)}`);
+        line("PASS: same-repo integration is serialized (no double-write)");
+      } else {
+        line(`FAIL: second complete_team was not rejected (${rejection ?? "succeeded"})`);
+        process.exitCode = 1;
+      }
+    } else {
+      step(4, "complete each run");
+      for (const session of sessions) {
+        const completed = await session.server.call("complete_team", {
+          request_id: nextRequestID(`complete-${session.index}`),
+          run_id: session.runID,
+          final_verdict: "PASS",
+          summary: `mcp-trace multi-run #${session.index + 1}`,
+        });
+        line(`run ${session.runID.slice(0, 8)} → ${completed.run.status}`);
+      }
+    }
+    console.log("\nDONE (--runs)");
+  } finally {
+    for (const session of sessions) session.server.child.kill("SIGTERM");
+    if (!flags.keep) {
+      for (const temp of temps) fs.rmSync(temp.dir, { recursive: true, force: true });
+      fs.rmSync(sharedDir, { recursive: true, force: true });
+    }
+  }
+  process.exit(process.exitCode ?? 0);
+}
+
 // ---------- main ----------
+
+if (flags.doctor) await doctorScenario();
+if (flags.runs > 0) {
+  if (flags.sameRepoSerial && flags.runs !== 2) {
+    console.error("--same-repo-serial requires --runs 2");
+    process.exit(2);
+  }
+  await multiRunScenario();
+}
 
 let temp = null;
 let databaseURL = null;

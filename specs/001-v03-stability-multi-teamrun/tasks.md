@@ -99,9 +99,9 @@ description: "Task list for v0.3 稳定性与多任务运行"
 
 ## Phase 7: Polish & Cross-Cutting Concerns
 
-- [ ] T029 [P] trace 扩展:`tools/mcp-trace.mjs` 加 --runs <n>(多 run 并行零串扰)/--same-repo-serial(集成串行)/--doctor(体检驱动)
-- [ ] T030 [P] 文档:README(workbench/doctor/恢复 工具面)+ docs/USAGE.md(工作台/诊断中心/恢复/三级并发设置章节)
-- [ ] T031 全量验证:`pnpm run typecheck` + 全套件 + quickstart 四场景;宪法自查(UI shadcn、进程核对只认带标识进程、恢复留痕、工作台纯派生无新事实源、仓储/状态机零修改)
+- [x] T029 [P] trace 扩展:`tools/mcp-trace.mjs` 加 --runs <n>(多 run 并行零串扰)/--same-repo-serial(集成串行)/--doctor(体检驱动)
+- [x] T030 [P] 文档:README(workbench/doctor/恢复 工具面)+ docs/USAGE.md(工作台/诊断中心/恢复/三级并发设置章节)
+- [x] T031 全量验证:`pnpm run typecheck` + 全套件 + quickstart 四场景;宪法自查(UI shadcn、进程核对只认带标识进程、恢复留痕、工作台纯派生无新事实源、仓储/状态机零修改)
 
 ---
 

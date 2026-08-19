@@ -107,6 +107,14 @@ gates with per-item pass/fail/waived/unknown results enforced before `accept_tas
 to-verify arbitration), and optional `create_pr` / `get_pr_status` (GitHub feedback via the
 local `gh` CLI, off by default, no tokens stored).
 
+v0.3 adds the multi-run control plane: concurrent TeamRuns across (and within) repositories
+behind a four-level concurrency budget (global / per-repo / per-agent-kind / per-run, strictest
+wins), run pause / resume / priority, a six-section global workbench, `run_doctor` /
+`get_doctor_report` (nine pre-flight environment checks), `get_recovery_status` / `rerun_task`
+(crash scan with PID liveness, orphan worktree/branch cleanup, node rerun with downstream
+reset), and resource-aware pacing that pauses *new* launches under system pressure without
+touching running tasks.
+
 ## Development
 
 Package manager: **pnpm** (11+). pnpm blocks dependency build scripts by default; the project
