@@ -216,11 +216,21 @@ export class PiCLIAdapter implements ChildAgentPort {
               path.join(os.homedir(), ".pi"),
             ]),
       };
-      const result = await this.process.runStreaming(
+      // T016 PID 上报:started 事件在 spawn 之前发出(见 run() 开头),无法
+      // 附带 pid,因此不挪动它的时序(避免 spawn 失败路径少发 started 的行为
+      // 变化),而是在 spawn 同步完成、拿到 streaming promise 之后紧跟发一个
+      // 携带 pid 的事件。kind 选 output:中性的执行日志事件(relay 侧有节流),
+      // 不重复触发 taskStarted。子进程闪退/判活失败时 pidOf 返回 null,静默跳过。
+      const streaming = this.process.runStreaming(
         request,
         (chunk) => liveDecoder.consume(chunk),
         signal,
       );
+      const pid = this.process.pidOf(processID);
+      if (pid != null) {
+        await onEvent({ kind: "output", message: `child process pid ${pid}`, sessionID, pid });
+      }
+      const result = await streaming;
       const report = this.parse(result.stdout, result.stderr);
       this.processRegistry.set(report.sessionID, processID);
       await onEvent({ kind: "completed", message: report.message, sessionID: report.sessionID });

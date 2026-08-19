@@ -4,13 +4,14 @@ import { randomUUID } from "node:crypto";
 import type {
   JoinTasksDTO,
   JoinedTaskDTO,
+  QueueReasonDTO,
 } from "../../shared/dtos";
 import {
   DomainError,
   runStatusIsTerminal,
   taskStatusIsTerminal,
 } from "../domain/models";
-import type { ChildTask, ReviewFeedback, TeamRun } from "../domain/models";
+import type { ChildTask, ReviewFeedback, RunSummary, TeamRun } from "../domain/models";
 import { TaskEventHub } from "../domain/events";
 import type { TaskEventUpdate } from "../domain/events";
 import {
@@ -42,6 +43,11 @@ import type { GateEvaluation } from "../domain/repositoryPort";
 import type { GateConfigInput } from "../domain/policy";
 import type { ChildExecutionService } from "./childExecutionService";
 import type { TaskIntegrationService } from "./taskIntegrationService";
+import type {
+  ConcurrencyActiveCounts,
+  ConcurrencyBudget,
+  ConcurrencyBudgetTask,
+} from "./concurrencyBudget";
 
 interface ChildWork {
   controller: AbortController;
@@ -115,6 +121,16 @@ export class AgentTeamApplicationService {
   private retryCounts = new Map<string, number>();
   /** Instance-wide launch pacer: enforces the stagger interval across runs. */
   private lastLaunchAt = 0;
+  /**
+   * 中央并发预算(specs/001-v03 T008):注入后所有 launch 路径的闸门以预算的
+   * granted 记账为准(四级联检在预算内部);未注入(测试/最小组合根)时回退
+   * 原有的 activeChildCount run 级判定。
+   */
+  private readonly concurrencyBudget?: ConcurrencyBudget;
+  /** queued 任务的排队原因(闸门拒绝级别);任务获配额/终态时清除。 */
+  private queueReasons = new Map<string, { runID: string; reason: QueueReasonDTO }>();
+  /** Runs the scheduler has drained at least once; drives global re-drain on freed capacity. */
+  private knownRunIDs = new Set<string>();
 
   constructor(input: {
     repository: TeamRunRepository;
@@ -123,6 +139,7 @@ export class AgentTeamApplicationService {
     eventHub?: TaskEventHub | null;
     executionPolicy?: () => ExecutionPolicy | null;
     qualityGate?: QualityGatePort | null;
+    concurrencyBudget?: ConcurrencyBudget | null;
   }) {
     this.repository = input.repository;
     this.childExecution = input.childExecution;
@@ -130,6 +147,12 @@ export class AgentTeamApplicationService {
     this.eventHub = input.eventHub ?? null;
     this.executionPolicy = input.executionPolicy;
     this.qualityGatePort = input.qualityGate ?? undefined;
+    this.concurrencyBudget = input.concurrencyBudget ?? undefined;
+    // 预算释放/恢复事件驱动的重排:预算先于本服务构造,组合根若未在预算构造时
+    // 注入 onCapacityFreed,此处兜底回接(ifAbsent 不覆盖显式注入的处理者)。
+    this.concurrencyBudget?.setCapacityFreedHandler((runID) => this.onCapacityFreed(runID), {
+      ifAbsent: true,
+    });
   }
 
   async startTeam(
@@ -393,6 +416,68 @@ export class AgentTeamApplicationService {
     return teamStatusDTO(await this.repository.snapshot(runID));
   }
 
+  /**
+   * 排队原因查询(specs/001-v03 FR-016 / interfaces.md A 节):run 内仍在排队且
+   * 被闸门拒绝的任务及其原因,供 get_team_status / IPC / 工作台投影。仅含非空
+   * 闸门原因(run 级饱和 = 既有 run 内排队,不在此列)。数组顺序稳定(按记录序)。
+   */
+  getQueueReasons(runID: string): Array<{ taskID: string; reason: QueueReasonDTO }> {
+    const reasons: Array<{ taskID: string; reason: QueueReasonDTO }> = [];
+    for (const [taskID, entry] of this.queueReasons) {
+      if (entry.runID === runID) reasons.push({ taskID, reason: entry.reason });
+    }
+    return reasons;
+  }
+
+  /** 预算计数透传(四级生效上限 + 各维活跃数,契约不变量 1);未注入预算时为 null。 */
+  getConcurrencyCounts(): ConcurrencyActiveCounts | null {
+    return this.concurrencyBudget?.activeCounts() ?? null;
+  }
+
+  /**
+   * 未来恢复服务的调度入口(specs/001 R4 / T008 预留):拉起一个 run 的就绪队列,
+   * 与首启 drain 同一路径(预算闸门、排队原因、paused_at 镜像全部生效)。幂等,
+   * 终态 run 直接返回。
+   */
+  async drainReadyTasks(runID: string): Promise<void> {
+    await this.launchReadyTasks(runID);
+  }
+
+  // ---- v0.3 run 控制(specs/001-v03 T009 / interfaces.md A 节)----
+
+  /**
+   * 暂停 run(interfaces.md C 节不变量 4):停发该 run 的新任务配额,运行中
+   * 任务照常完成(红线:拒绝永不回收已授配额)。落库与审计事件由仓储承担;
+   * 成功后的 drain 不直调预算——launchReadyTasks 内部镜像 paused_at(T008),
+   * 顺带把 queued 任务的排队原因刷新为 run_paused。
+   */
+  async pauseRun(input: { requestID: string; runID: string }): Promise<TeamRun> {
+    const run = await this.repository.pauseRun(input);
+    await this.launchReadyTasks(run.id).catch(() => {});
+    return run;
+  }
+
+  /** 恢复已暂停 run:drain 镜像 paused_at=null 后,排队任务按优先级继续领配额。 */
+  async resumeRun(input: { requestID: string; runID: string }): Promise<TeamRun> {
+    const run = await this.repository.resumeRun(input);
+    await this.launchReadyTasks(run.id).catch(() => {});
+    return run;
+  }
+
+  /**
+   * 调整 run 调度优先级(-5..5 整数,越大约先得配额;越界校验与审计事件在
+   * 仓储)。成功后触发全局按序重排:空位配额总是先流向高优先级 run。
+   */
+  async setRunPriority(input: {
+    requestID: string;
+    runID: string;
+    priority: number;
+  }): Promise<TeamRun> {
+    const run = await this.repository.setRunPriority(input);
+    await this.drainAllByPriority().catch(() => {});
+    return run;
+  }
+
   async getTeamReviewContext(runID: string): Promise<import("../../shared/dtos").TeamReviewContextDTO> {
     this.startEventMonitor(runID);
     return teamReviewContextDTO(await this.repository.snapshot(runID));
@@ -482,8 +567,17 @@ export class AgentTeamApplicationService {
   }
 
   private async launchReadyTasks(runID: string): Promise<void> {
+    this.knownRunIDs.add(runID);
     const snapshot = await this.repository.snapshot(runID);
-    if (runStatusIsTerminal(snapshot.run.status)) return;
+    if (runStatusIsTerminal(snapshot.run.status)) {
+      this.knownRunIDs.delete(runID);
+      // Terminal runs leave the paused set so activeCounts stays honest.
+      this.concurrencyBudget?.setPaused(runID, false);
+      return;
+    }
+    // team_runs.paused_at (written by run control, T009) mirrors into the
+    // budget: a relaunched app must not hand new quotas to a paused run.
+    this.concurrencyBudget?.setPaused(runID, snapshot.run.pausedAt != null);
     for (const task of snapshot.tasks) {
       if (task.status !== "queued" && task.status !== "rework_required") continue;
       const dependencies = snapshot.dependencies.filter((dependency) => dependency.taskID === task.id);
@@ -492,14 +586,32 @@ export class AgentTeamApplicationService {
         return dependencyTask?.status === "accepted";
       });
       if (!ready) continue;
-      if (!(this.activeChildCount(runID) < snapshot.run.maxConcurrentTasks)) break;
-      const waitedMs = await this.paceNextLaunch();
+      // Gate consult BEFORE pacing: a saturated budget must not nap between
+      // hopeless attempts — the stagger exists to space real launches.
+      const precheck = this.consultBudget(task, snapshot.run);
+      if (!precheck.granted) {
+        this.recordQueueReason(task.id, runID, precheck.reason);
+        // Only kind_budget blocks solely this agent kind; every other level
+        // (global/project/run/pressure/paused) saturates the whole run's queue.
+        if (precheck.reason !== "kind_budget") break;
+        continue;
+      }
+      this.recordQueueReason(task.id, runID, null);
+      const waitedMs = await this.paceNextLaunch(() => {
+        this.recordQueueReason(task.id, runID, "launch_stagger");
+      });
       if (waitedMs > 0) {
         // The run's state may have changed while pacing (e.g. a sibling task
         // failed and blocked the queue, or the run was cancelled).
         const current = await this.repository.snapshot(runID);
         if (runStatusIsTerminal(current.run.status)) return;
-        if (!(this.activeChildCount(runID) < current.run.maxConcurrentTasks)) break;
+        const recheck = this.consultBudget(task, current.run);
+        if (!recheck.granted) {
+          this.recordQueueReason(task.id, runID, recheck.reason);
+          if (recheck.reason !== "kind_budget") break;
+          continue;
+        }
+        this.recordQueueReason(task.id, runID, null);
       }
       const preparedTask = await this.prepareBaselineIfNeeded(
         task,
@@ -507,20 +619,25 @@ export class AgentTeamApplicationService {
         dependencies,
         snapshot.tasks,
       );
-      await this.launch(preparedTask, snapshot.run);
+      const launched = await this.launch(preparedTask, snapshot.run);
+      // A last-moment denial inside launch already recorded its reason; the
+      // freed-capacity callback will re-drain when a slot opens up.
+      if (!launched) break;
     }
   }
 
   /**
    * Staggers consecutive child launches by the configured interval so a batch
    * does not hit the model endpoint simultaneously (GLM/Anthropic 429/529).
-   * Returns the time actually waited; 0 when pacing is disabled.
+   * Returns the time actually waited; 0 when pacing is disabled. `onWaitStart`
+   * fires only when a real wait begins (queue reason `launch_stagger`).
    */
-  private async paceNextLaunch(): Promise<number> {
+  private async paceNextLaunch(onWaitStart?: () => void): Promise<number> {
     const staggerSeconds = this.executionPolicy?.()?.launchStaggerSeconds ?? 0;
     if (staggerSeconds <= 0) return 0;
     const waitMs = Math.max(0, this.lastLaunchAt + staggerSeconds * 1000 - Date.now());
     if (waitMs > 0) {
+      onWaitStart?.();
       await new Promise((resolve) => {
         setTimeout(resolve, waitMs).unref?.();
       });
@@ -617,9 +734,23 @@ export class AgentTeamApplicationService {
     });
   }
 
-  private async launch(task: ChildTask, run: TeamRun): Promise<void> {
-    if (this.childRunIDs.has(task.id)) return;
-    this.ensureCapacity(run.id, run.maxConcurrentTasks);
+  /**
+   * Launches one ready task. Returns false when the central budget denied the
+   * quota (task stays queued, reason recorded) — denial is not an error. The
+   * no-budget fallback keeps the legacy run-level ensureCapacity throw.
+   */
+  private async launch(task: ChildTask, run: TeamRun): Promise<boolean> {
+    if (this.childRunIDs.has(task.id)) return true;
+    if (this.concurrencyBudget != null) {
+      const decision = this.concurrencyBudget.tryAcquire(this.budgetTask(task, run));
+      if (!decision.granted) {
+        this.recordQueueReason(task.id, run.id, decision.reason);
+        return false;
+      }
+      this.recordQueueReason(task.id, run.id, null);
+    } else {
+      this.ensureCapacity(run.id, run.maxConcurrentTasks);
+    }
 
     this.childRunIDs.set(task.id, run.id);
     const repository = this.repository;
@@ -706,8 +837,10 @@ export class AgentTeamApplicationService {
       })();
       this.childWork.set(task.id, { controller, done });
       void done.catch(() => {});
+      return true;
     } catch (error) {
       this.childRunIDs.delete(task.id);
+      this.concurrencyBudget?.release(run.id, task.id);
       throw error;
     }
   }
@@ -715,7 +848,28 @@ export class AgentTeamApplicationService {
   private async removeWork(taskID: string, runID: string): Promise<void> {
     this.childWork.delete(taskID);
     this.childRunIDs.delete(taskID);
+    this.queueReasons.delete(taskID);
+    // release() fires the capacity-freed callback (global re-drain); the
+    // explicit same-run drain below keeps the no-budget path unchanged.
+    this.concurrencyBudget?.release(runID, taskID);
+    // T016:成功/失败/取消三条终态路径(含 stop() 经 abort→done 的汇入)统一
+    // 经此处收尾,attempt 的 pid 必须随之清空,否则崩溃恢复探活会读到陈旧 pid
+    // 把已死任务误判成「进程仍在」。尽力而为:清理失败不影响排空路径。
+    await this.clearAttemptPid(taskID, runID);
     await this.launchReadyTasks(runID).catch(() => {});
+  }
+
+  /** T016:task.currentAttemptID 非空时把 task_attempts.pid 置回 null(尽力而为)。 */
+  private async clearAttemptPid(taskID: string, runID: string): Promise<void> {
+    try {
+      const snapshot = await this.repository.snapshot(runID);
+      const task = snapshot.tasks.find((candidate) => candidate.id === taskID);
+      const attemptID = task?.currentAttemptID;
+      if (attemptID == null) return;
+      await this.repository.updateAttemptPid({ runID, taskID, attemptID, pid: null });
+    } catch {
+      // run/attempt 可能已被归档删除;pid 卫生不阻断调度收尾。
+    }
   }
 
   /**
@@ -773,7 +927,11 @@ export class AgentTeamApplicationService {
           const task = snapshot.tasks.find((candidate) => candidate.id === taskID);
           if (task == null || (task.status !== "queued" && task.status !== "rework_required")) return;
           if (this.childRunIDs.has(task.id)) return;
-          await this.paceNextLaunch();
+          await this.paceNextLaunch(() => {
+            this.recordQueueReason(taskID, runID, "launch_stagger");
+          });
+          // A denial here keeps the task queued (reason recorded inside
+          // launch) and the drain below still serves ready siblings.
           await this.launch(task, snapshot.run);
           await this.launchReadyTasks(runID);
         } catch {
@@ -797,6 +955,87 @@ export class AgentTeamApplicationService {
     }
   }
 
+  /**
+   * 闸门咨询(纯查询,不占配额):预算模式下委托 wouldGrant 四级联检;未注入
+   * 预算(测试/最小组合根)时回退原有 activeChildCount 的 run 级判定。
+   */
+  private consultBudget(
+    task: ChildTask,
+    run: TeamRun,
+  ): { granted: boolean; reason: QueueReasonDTO | null } {
+    if (this.concurrencyBudget == null) {
+      return { granted: this.activeChildCount(run.id) < run.maxConcurrentTasks, reason: null };
+    }
+    return this.concurrencyBudget.wouldGrant(this.budgetTask(task, run));
+  }
+
+  private budgetTask(task: ChildTask, run: TeamRun): ConcurrencyBudgetTask {
+    return {
+      taskID: task.id,
+      runID: run.id,
+      repositoryPath: run.repositoryPath,
+      agentKind: task.agentKind,
+      runMaxConcurrentTasks: run.maxConcurrentTasks,
+      // 委派期 interactive 标记属 T026;当前所有常规任务都走共享配额。
+      interactive: false,
+    };
+  }
+
+  /**
+   * 排队原因落账:reason=null 表示无闸门原因(run 级饱和或已获配额),清除记录。
+   */
+  private recordQueueReason(taskID: string, runID: string, reason: QueueReasonDTO | null): void {
+    if (reason == null) {
+      this.queueReasons.delete(taskID);
+      return;
+    }
+    this.queueReasons.set(taskID, { runID, reason });
+  }
+
+  /**
+   * 预算容量恢复回调(release/暂停恢复/资源恢复触发):runID = 仅该 run 恢复
+   * 资格;null = 全局空位 → 按优先级重排所有活跃 run。fire-and-forget,不阻塞
+   * 释放方;launch 的同步预占 + childRunIDs 幂等守卫让并发 drain 不会重复启动。
+   */
+  private onCapacityFreed(runID: string | null): void {
+    if (runID != null) {
+      void this.launchReadyTasks(runID).catch(() => {});
+      return;
+    }
+    void this.drainAllByPriority().catch(() => {});
+  }
+
+  /**
+   * 全局按序重排(T009):活跃 run 按 priority DESC、created_at ASC 排序后逐 run
+   * drain——空出的配额总是先流向高优先级 run。候选集取 listRuns 的非终态 run
+   * (数据库是跨进程事实源,覆盖本实例从未 drain 过的 run);run 级轻量摘要用于
+   * 补齐排序所需的 created_at,读取失败(如并发隐藏)的 run 跳过,不阻断其余
+   * 重排。暂停中的 run 保留在序列里:drain 会镜像 paused 状态并把其 queued
+   * 任务的原因刷新为 run_paused(不变量 4)。
+   */
+  private async drainAllByPriority(): Promise<void> {
+    const summaries = await this.repository.listRuns();
+    const ordered = await Promise.all(
+      summaries
+        .filter((summary) => !runStatusIsTerminal(summary.status))
+        .map(async (summary): Promise<RunSummary | null> => {
+          try {
+            return await this.repository.runSummary(summary.id);
+          } catch {
+            return null;
+          }
+        }),
+    );
+    const runs = ordered
+      .filter((summary): summary is RunSummary => summary != null)
+      .map((summary) => summary.run)
+      .sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt);
+    for (const run of runs) {
+      // 逐 run 串行 drain 保序:前一个 run 领满配额后,剩余空位才轮到下一个。
+      await this.launchReadyTasks(run.id).catch(() => {});
+    }
+  }
+
   private async stop(task: ChildTask): Promise<void> {
     if (task.sessionID != null) {
       await this.childExecution.cancel(task.sessionID, task.agentKind as ChildAgentKind);
@@ -808,6 +1047,9 @@ export class AgentTeamApplicationService {
     }
     this.childWork.delete(task.id);
     this.childRunIDs.delete(task.id);
+    this.queueReasons.delete(task.id);
+    // No-op for tasks that never launched (stop sweeps whole runs too).
+    this.concurrencyBudget?.release(task.runID, task.id);
   }
 }
 

@@ -64,6 +64,10 @@ export interface TeamRunDTO {
   currentReviewRound: number;
   maxReviewRounds: number;
   revision: number;
+  /** 调度优先级(-5..5,越大越先得并发配额;v0.3)。 */
+  priority: number;
+  /** 暂停时间戳;null = 未暂停(v0.3)。 */
+  pausedAt: EpochSeconds | null;
   createdAt: EpochSeconds;
   updatedAt: EpochSeconds;
 }

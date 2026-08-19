@@ -24,6 +24,7 @@ import { SettingsView } from "@/features/settings/SettingsView";
 import { StartForm } from "@/features/dashboard/StartForm";
 import { BatchDelegatePanel } from "@/features/dashboard/BatchDelegatePanel";
 import { ReviewCenterView } from "@/features/reviewCenter/ReviewCenterView";
+import { WorkbenchView } from "@/features/workbench/WorkbenchView";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -38,7 +39,7 @@ import { SidebarProvider } from "@/components/ui/sidebar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
-type Page = "run" | "new-run" | "delegate" | "settings" | "review-center";
+type Page = "run" | "new-run" | "delegate" | "settings" | "review-center" | "workbench";
 
 const TOOLBAR_BUTTON =
   "border-border text-muted-foreground hover:bg-muted hover:text-foreground app-no-drag flex size-7 cursor-pointer items-center justify-center rounded-md border transition-colors";
@@ -54,6 +55,8 @@ const EMPTY_SUMMARY: RunSummaryDTO = {
     currentReviewRound: 0,
     maxReviewRounds: 0,
     revision: 0,
+    priority: 0,
+    pausedAt: null,
     createdAt: 0,
     updatedAt: 0,
   },
@@ -189,6 +192,8 @@ export function TeamDashboardView() {
               appState.setSelectedRunID(null);
               setPage("new-run");
             }}
+            onOpenWorkbench={() => setPage("workbench")}
+            workbenchActive={page === "workbench"}
             onOpenReviewCenter={() => setPage("review-center")}
             reviewActive={page === "review-center"}
             onOpenSettings={() => setPage("settings")}
@@ -205,6 +210,13 @@ export function TeamDashboardView() {
           </div>
         ) : page === "review-center" ? (
           <ReviewCenterView />
+        ) : page === "workbench" ? (
+          <WorkbenchView
+            onSelectRun={(id) => {
+              appState.setSelectedRunID(id);
+              setPage("run");
+            }}
+          />
         ) : page === "new-run" || runID == null ? (
           <div className="flex-1 overflow-y-auto">
             <StartForm onStarted={() => setPage("run")} />

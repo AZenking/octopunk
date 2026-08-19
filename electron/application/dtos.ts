@@ -42,6 +42,8 @@ export function teamRunDTO(run: TeamRun): import("../../shared/dtos").TeamRunDTO
     currentReviewRound: run.currentReviewRound,
     maxReviewRounds: run.maxReviewRounds,
     revision: run.revision,
+    priority: run.priority,
+    pausedAt: run.pausedAt,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   };

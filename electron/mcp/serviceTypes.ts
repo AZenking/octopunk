@@ -4,10 +4,12 @@ import type {
   ChildTaskDTO,
   DelegateTasksResultDTO,
   JoinTasksDTO,
+  QueueReasonDTO,
   TaskExecutionLogSliceDTO,
   TaskReportDTO,
   TeamReviewContextDTO,
   TeamStatusDTO,
+  WorkbenchSectionDTO,
 } from "../../shared/dtos";
 import type {
   DelegateTaskInput,
@@ -16,6 +18,7 @@ import type {
   ReviewDecisionInput,
   StartTeamInput,
 } from "../domain/repositoryPort";
+import type { TeamRun } from "../domain/models";
 import type { ReviewCenterService } from "../application/reviewCenterService";
 import type { QualityGateService } from "../application/qualityGateService";
 import type { ReviewModeService } from "../application/reviewModeService";
@@ -65,6 +68,30 @@ export interface AgentTeamServicePortLike {
   discardTeam(input: { requestID: string; runID: string }): Promise<TeamStatusDTO>;
   archiveTeam(input: { requestID: string; runID: string }): Promise<void>;
   unarchiveTeam(input: { requestID: string; runID: string }): Promise<void>;
+  // ---- v0.3 run 控制(specs/001-v03 T009/T010;interfaces.md A 节)----
+  /**
+   * Pause a run: new quota grants stop, in-flight tasks continue. Returns the
+   * domain TeamRun JSON (priority/pausedAt included). Optional like the service
+   * blocks below: until the service exposes T009's methods the MCP run-control
+   * tools answer with a readable error instead of failing to build.
+   */
+  pauseRun?(input: { requestID: string; runID: string }): Promise<TeamRun>;
+  /** Resume a paused run; queued tasks continue by priority. */
+  resumeRun?(input: { requestID: string; runID: string }): Promise<TeamRun>;
+  /** Scheduling priority: integer -5..5 (bounds validated at dispatch and in the repository). */
+  setRunPriority?(input: { requestID: string; runID: string; priority: number }): Promise<TeamRun>;
+  /**
+   * Gate-rejection queue reasons for a run's queued tasks (specs/001 FR-016).
+   * Optional: get_team_status degrades to an empty list without it.
+   */
+  getQueueReasons?(runID: string): Array<{ taskID: string; reason: QueueReasonDTO }>;
+  /**
+   * Workbench six-section aggregate (specs/001 US2) shared by GUI and MCP
+   * (constitution principle two); appEnvironment wires the same instance the
+   * IPC channel uses. Optional: until then the get_workbench tool answers
+   * with a readable error.
+   */
+  workbench?: { summary(): Promise<WorkbenchSectionDTO[]> };
   /**
    * Review Center use cases (task diff, line-anchored comments, batch rework,
    * delivery summary) shared by GUI and MCP (constitution principle two).

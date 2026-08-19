@@ -23,6 +23,7 @@ import type { TaskEventUpdate } from "../domain/events";
 import { OctoPunkContextServer } from "../application/ports";
 import { stableStringify } from "../domain/events";
 import { GATE_REVIEW_MODES, type GateReviewMode, type ReviewFinding } from "../domain/models";
+import { RUN_PRIORITY_MIN, RUN_PRIORITY_MAX } from "../domain/models";
 import { randomReviewFindingID } from "./ids";
 import { OctoPunkHTTPApplication } from "./httpApplication";
 
@@ -71,6 +72,11 @@ export class OctoPunkMCPServer {
     qualityGate?: QualityGateService | null;
     /** Review Mode service; when present the review/arbitration tools become available. */
     reviewModes?: ReviewModeService | null;
+    /**
+     * Workbench six-section aggregate service; when present the get_workbench
+     * tool becomes available (same instance the IPC channel uses).
+     */
+    workbench?: AgentTeamServicePortLike["workbench"];
   }) {
     // Prototype-chain delegation keeps reads live against the underlying
     // service instance while exposing the optional reviewCenter field.
@@ -80,6 +86,8 @@ export class OctoPunkMCPServer {
     this.service.qualityGate = input.qualityGate ?? undefined;
     // Same delegation pattern for the review mode service (see above).
     this.service.reviewModes = input.reviewModes ?? undefined;
+    // Same delegation pattern for the workbench aggregate service (see above).
+    this.service.workbench = input.workbench ?? undefined;
     this.git = input.git;
     this.keychain = input.keychain;
     this.eventHub = input.eventHub ?? null;
@@ -616,6 +624,34 @@ export function fullToolList(): Tool[] {
       [],
     ),
     tool(
+      "pause_team",
+      `Pause a TeamRun: new quota grants stop while in-flight tasks continue; queued tasks stay queued with reason run_paused. Returns the updated run (priority/pausedAt included). ${runIDNote}`,
+      { request_id: stringSchema(), run_id: stringSchema() },
+      ["request_id"],
+    ),
+    tool(
+      "resume_team",
+      `Resume a paused TeamRun: queued tasks continue by priority. Returns the updated run (priority/pausedAt included). ${runIDNote}`,
+      { request_id: stringSchema(), run_id: stringSchema() },
+      ["request_id"],
+    ),
+    tool(
+      "set_run_priority",
+      `Set a TeamRun's scheduling priority (integer ${RUN_PRIORITY_MIN}..${RUN_PRIORITY_MAX}, higher = earlier quota grants). Returns the updated run (priority/pausedAt included). ${runIDNote}`,
+      {
+        request_id: stringSchema(),
+        run_id: stringSchema(),
+        priority: { type: "integer", minimum: RUN_PRIORITY_MIN, maximum: RUN_PRIORITY_MAX },
+      },
+      ["request_id", "priority"],
+    ),
+    tool(
+      "get_workbench",
+      "Read the six-section workbench aggregate across active TeamRuns (running, queued, awaiting_input, failed, awaiting_review, integratable); queued entries carry their queue reason.",
+      {},
+      [],
+    ),
+    tool(
       "get_team_review_context",
       `Read all reports and audit events for final Codex review. ${runIDNote}`,
       { run_id: stringSchema() },
@@ -1080,7 +1116,70 @@ async function dispatchTool(
       return stableStringify(result);
     }
     case "get_team_status": {
-      return stableStringify(await service.getTeamStatus(await resolveRunID(service, arguments_, sessionID)));
+      const runID = await resolveRunID(service, arguments_, sessionID);
+      const status = await service.getTeamStatus(runID);
+      // v0.3 扩展(interfaces.md A 节):queueReasons 只保留仍在排队的任务原因
+      // (getQueueReasons 仅含被闸门拒绝的在册条目,此处按任务状态再过滤一次);
+      // 未接线时降级为空列表,不影响既有 get_team_status 输出。
+      const queuedTaskIDs = new Set(
+        status.tasks.filter((task) => task.status === "queued").map((task) => task.id),
+      );
+      const queueReasons =
+        service.getQueueReasons == null
+          ? []
+          : service.getQueueReasons(runID).filter((entry) => queuedTaskIDs.has(entry.taskID));
+      // priority/pausedAt 透传自 run 序列化(TeamRunDTO 未含字段时 stableStringify
+      // 省略该键;DTO 补齐字段后此处零改动即生效)。
+      const { priority, pausedAt } = status.run as { priority?: number; pausedAt?: number | null };
+      return stableStringify({ ...status, priority, pausedAt, queueReasons });
+    }
+    case "pause_team": {
+      if (service.pauseRun == null) {
+        throw new Error("pause_team is unavailable: the team service does not expose run control in this build.");
+      }
+      const run = await service.pauseRun({
+        requestID: requireString(arguments_, "request_id"),
+        runID: await resolveRunID(service, arguments_, sessionID),
+      });
+      return stableStringify(run);
+    }
+    case "resume_team": {
+      if (service.resumeRun == null) {
+        throw new Error("resume_team is unavailable: the team service does not expose run control in this build.");
+      }
+      const run = await service.resumeRun({
+        requestID: requireString(arguments_, "request_id"),
+        runID: await resolveRunID(service, arguments_, sessionID),
+      });
+      return stableStringify(run);
+    }
+    case "set_run_priority": {
+      if (service.setRunPriority == null) {
+        throw new Error("set_run_priority is unavailable: the team service does not expose run control in this build.");
+      }
+      const rawPriority = arguments_.priority;
+      if (
+        typeof rawPriority !== "number" ||
+        !Number.isInteger(rawPriority) ||
+        rawPriority < RUN_PRIORITY_MIN ||
+        rawPriority > RUN_PRIORITY_MAX
+      ) {
+        throw new InvalidParamsError(
+          `priority must be an integer between ${RUN_PRIORITY_MIN} and ${RUN_PRIORITY_MAX} (got ${
+            typeof rawPriority === "number" ? rawPriority : JSON.stringify(rawPriority) ?? "missing"
+          }).`,
+        );
+      }
+      const run = await service.setRunPriority({
+        requestID: requireString(arguments_, "request_id"),
+        runID: await resolveRunID(service, arguments_, sessionID),
+        priority: rawPriority,
+      });
+      return stableStringify(run);
+    }
+    case "get_workbench": {
+      const workbench = requireWorkbench(service);
+      return stableStringify(await workbench.summary());
     }
     case "get_team_review_context": {
       return stableStringify(await service.getTeamReviewContext(await resolveRunID(service, arguments_, sessionID)));
@@ -1284,6 +1383,18 @@ function requireReviewModes(service: AgentTeamServicePortLike): ReviewModeServic
     throw new Error("Review mode tools are unavailable: the reviewModes service is not wired in this build.");
   }
   return service.reviewModes;
+}
+
+/**
+ * Workbench aggregate shares the team service port (structural `{ summary }`
+ * port); until appEnvironment wires the instance the tool answers with a
+ * readable error instead of failing to build.
+ */
+function requireWorkbench(service: AgentTeamServicePortLike): NonNullable<AgentTeamServicePortLike["workbench"]> {
+  if (service.workbench == null) {
+    throw new Error("Workbench tool is unavailable: the workbench service is not wired in this build.");
+  }
+  return service.workbench;
 }
 
 /** run_review 的轮询节奏(与 ReviewModeService.collectArbitration 内部节奏一致)。 */

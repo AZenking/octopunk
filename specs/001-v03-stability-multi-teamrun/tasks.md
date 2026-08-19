@@ -45,15 +45,15 @@ description: "Task list for v0.3 稳定性与多任务运行"
 
 **Independent Test**: quickstart 场景 1 —— 仓库 A/B 并行 TeamRun 零串扰;全局并发调 1 时新任务排队且原因可见;同仓库双 run 集成串行(后到者拒)。
 
-- [ ] T007 [US1] GUI 多 run 解锁:`electron/ipc.ts` team:start 处理器为每次启动生成独立 sessionID(`gui-<uuid>`,research R1——不改仓储检查);验证 GUI 可同时存在多个活跃 run
-- [ ] T008 [US1] 并发预算:`electron/application/concurrencyBudget.ts` —— 四级闸门(全局/项目/单 Agent 类型/run.maxConcurrentTasks 取最严)、申请/释放、拒绝原因(global_budget/project_budget/kind_budget/run_paused)、释放事件驱动重排;接入 `agentTeamService` 全部 launch 路径(首启/重试/审查/恢复),替代仅按 run 计数的 activeChildCount 判定(deps: T004, T005)
-- [ ] T009 [US1] run 控制:pause(停发该 run 配额,运行中不受影响)/resume/setPriority 排序接入闸门队列;审计事件贯通(deps: T005, T008)
-- [ ] T010 [P] [US1] MCP 工具:`electron/mcp/server.ts` 加 pause_team/resume_team/set_run_priority/get_workbench;get_team_status 输出附 priority/pausedAt/排队任务 queueReason(deps: T008, T009)
-- [ ] T011 [P] [US1] IPC 通道:`electron/ipc.ts`+`electron/preload.ts` 注册 workbench:summary、run:pause/resume/set-priority、scheduler:settings;事件流推送 run.paused 等新 kind
-- [ ] T012 [P] [US1] 工作台 UI:`src/features/workbench/WorkbenchView.tsx` 六分区聚合视图 + 侧栏顶级入口 + 分区项跳转对应 run(全 shadcn,布局参考 v0)
-- [ ] T013 [US1] 设置 UI:常规区三级并发与生效值展示(四级联检 min 值明示)(deps: T004, T011)
-- [ ] T014 [US1] tests/concurrency.test.ts:四级取最严、多仓库并行零串扰(任务/worktree/事件交叉断言)、同仓库双 run 集成串行后到者拒、暂停不伤运行中(deps: T008, T009)
-- [ ] T015 [US1] quickstart 场景 1 走查(GUI 或 trace 驱动)
+- [x] T007 [US1] GUI 多 run 解锁:`electron/ipc.ts` team:start 处理器为每次启动生成独立 sessionID(`gui-<uuid>`,research R1——不改仓储检查);验证 GUI 可同时存在多个活跃 run
+- [x] T008 [US1] 并发预算:`electron/application/concurrencyBudget.ts` —— 四级闸门(全局/项目/单 Agent 类型/run.maxConcurrentTasks 取最严)、申请/释放、拒绝原因(global_budget/project_budget/kind_budget/run_paused)、释放事件驱动重排;接入 `agentTeamService` 全部 launch 路径(首启/重试/审查/恢复),替代仅按 run 计数的 activeChildCount 判定(deps: T004, T005)
+- [x] T009 [US1] run 控制:pause(停发该 run 配额,运行中不受影响)/resume/setPriority 排序接入闸门队列;审计事件贯通(deps: T005, T008)
+- [x] T010 [P] [US1] MCP 工具:`electron/mcp/server.ts` 加 pause_team/resume_team/set_run_priority/get_workbench;get_team_status 输出附 priority/pausedAt/排队任务 queueReason(deps: T008, T009)
+- [x] T011 [P] [US1] IPC 通道:`electron/ipc.ts`+`electron/preload.ts` 注册 workbench:summary、run:pause/resume/set-priority、scheduler:settings;事件流推送 run.paused 等新 kind
+- [x] T012 [P] [US1] 工作台 UI:`src/features/workbench/WorkbenchView.tsx` 六分区聚合视图 + 侧栏顶级入口 + 分区项跳转对应 run(全 shadcn,布局参考 v0)
+- [x] T013 [US1] 设置 UI:常规区三级并发与生效值展示(四级联检 min 值明示)(deps: T004, T011)
+- [x] T014 [US1] tests/concurrency.test.ts:四级取最严、多仓库并行零串扰(任务/worktree/事件交叉断言)、同仓库双 run 集成串行后到者拒、暂停不伤运行中(deps: T008, T009)
+- [ ] T015 [US1] quickstart 场景 1 走查(自动化等价断言已由 T014 覆盖;GUI 走查与 mcp-trace --runs 留用户/T029)
 
 ---
 
@@ -63,8 +63,8 @@ description: "Task list for v0.3 稳定性与多任务运行"
 
 **Independent Test**: quickstart 场景 2 —— kill 主进程与子进程后重启,状态 100% 可解释;孤儿显式清理;rerun 只重置受影响路径。
 
-- [ ] T016 [US2] PID 持久化:`LocalProcessAdapter`/适配器链路把子进程 PID 写入 attempt(updateAttemptPid),正常退出清除;若 runStreaming 未暴露 PID 则最小扩展 ProcessPort(research R4)
-- [ ] T017 [P] [US2] 平台探测:`electron/platform/diagnosticsProbes.ts` —— 进程探活(ps 按 PID,只认带 octopunk 标识的命令行)、孤儿 worktree/临时分支扫描(对照 DB 登记)、磁盘 statfs 与负载采样(US3/US4 复用);全部经端口类型导出供服务注入
+- [x] T016 [US2] PID 持久化:`LocalProcessAdapter`/适配器链路把子进程 PID 写入 attempt(updateAttemptPid),正常退出清除;若 runStreaming 未暴露 PID 则最小扩展 ProcessPort(research R4)
+- [x] T017 [P] [US2] 平台探测:`electron/platform/diagnosticsProbes.ts` —— 进程探活(ps 按 PID,只认带 octopunk 标识的命令行)、孤儿 worktree/临时分支扫描(对照 DB 登记)、磁盘 statfs 与负载采样(US3/US4 复用);全部经端口类型导出供服务注入
 - [ ] T018 [US2] 恢复服务:`electron/application/recoveryService.ts` —— 启动扫描(非终态 run 的 running 任务→探活分类:进程仍在/已死)、恢复视图聚合、孤儿清单与显式确认清理、rerunTask(include_downstream 下游重置,复用 resumeTask 语义)、全部 recovery.action 审计(deps: T005, T017)
 - [ ] T019 [US2] 接线:`electron/appEnvironment.ts` 启动后异步扫描(不打断启动);MCP get_recovery_status/rerun_task + IPC recovery:status/rerun/cleanup-orphans(清理需显式 confirm)(deps: T018)
 - [ ] T020 [P] [US2] 恢复视图 UI:工作台「执行失败/等待输入」分区入口或运行详情内恢复区 —— 进程仍在标注、失败原因(五类)、重跑(含下游 Switch)、孤儿清理确认 Dialog(deps: T019)

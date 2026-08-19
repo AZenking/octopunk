@@ -13,17 +13,27 @@ import {
   CUSTOM_INSTRUCTIONS_KEY,
   DISABLED_AGENTS_KEY,
   GITHUB_FEEDBACK_ENABLED_KEY,
+  GLOBAL_MAX_CHILDREN_KEY,
+  INTERACTIVE_SLOT_RESERVED_KEY,
   LAUNCH_STAGGER_SECONDS_KEY,
   MAX_CONCURRENT_TASKS_KEY,
+  MIN_FREE_DISK_BYTES_KEY,
+  PER_KIND_MAX_CHILDREN_KEY,
+  PER_PROJECT_MAX_CHILDREN_KEY,
   PI_CHILD_MODEL_KEY,
   PI_EXECUTABLE_KEY,
+  RESOURCE_PAUSE_ENABLED_KEY,
   TASK_RETRY_LIMIT_KEY,
 } from "./settingsStore";
 import type { AsyncStream } from "./domain/repositoryPort";
 import type { PrLink } from "./domain/repositoryPort";
 import type { GithubPrStatus } from "./application/reviewCenterService";
 import {
+  clampGlobalMaxChildren,
   clampLaunchStaggerSeconds,
+  clampMinFreeDiskBytes,
+  clampPerKindMaxChildren,
+  clampPerProjectMaxChildren,
   clampTaskRetryLimit,
   DEFAULT_MAX_CONCURRENT_TASKS,
   MAX_CONCURRENT_TASKS_LIMIT,
@@ -32,8 +42,15 @@ import {
   type DelegateTaskItemPayload,
   type ExecutionPolicyPayload,
   type MaxConcurrentTasksPayload,
+  type SchedulerSettingsPayload,
 } from "../shared/ipc";
-import type { DiffPageDTO, DiffTreeEntryDTO, GateConfigDTO, GateStartOverrideDTO } from "../shared/dtos";
+import type {
+  DiffPageDTO,
+  DiffTreeEntryDTO,
+  GateConfigDTO,
+  GateStartOverrideDTO,
+  RunControlDTO,
+} from "../shared/dtos";
 import type { GateConfigInput } from "./domain/policy";
 import { GATE_REVIEW_MODES, type GateReviewMode } from "./domain/models";
 
@@ -48,9 +65,6 @@ function reviewModeOrThrow(value: string): GateReviewMode {
 export interface RegisteredObservers {
   dispose: () => void;
 }
-
-/** Stable session identity for runs started from the Electron GUI itself. */
-export const LOCAL_UI_SESSION_ID = "local-ui";
 
 /**
  * config_json 安全解码:解析失败/非对象视为无配置(null),与
@@ -113,6 +127,24 @@ function githubFeedbackEnabled(environment: AppEnvironment): boolean {
   return environment.settings.string(GITHUB_FEEDBACK_ENABLED_KEY) === "true";
 }
 
+/**
+ * scheduler:settings 六键读取(specs/001-v03 B 节):数值键缺省/越界钳回默认,
+ * 布尔键沿用 settingsStore 惯例(缺省即开;仅显式 "false" 关闭)——与
+ * makeSettingsStoreBudgetSettings 同一语义,GUI 读取值即调度器生效值。
+ */
+function schedulerSettingsPayload(environment: AppEnvironment): SchedulerSettingsPayload {
+  return {
+    globalMaxChildren: clampGlobalMaxChildren(environment.settings.string(GLOBAL_MAX_CHILDREN_KEY)),
+    perProjectMaxChildren: clampPerProjectMaxChildren(
+      environment.settings.string(PER_PROJECT_MAX_CHILDREN_KEY),
+    ),
+    perKindMaxChildren: clampPerKindMaxChildren(environment.settings.string(PER_KIND_MAX_CHILDREN_KEY)),
+    resourcePauseEnabled: environment.settings.string(RESOURCE_PAUSE_ENABLED_KEY) !== "false",
+    minFreeDiskBytes: clampMinFreeDiskBytes(environment.settings.string(MIN_FREE_DISK_BYTES_KEY)),
+    interactiveSlotReserved: environment.settings.string(INTERACTIVE_SLOT_RESERVED_KEY) !== "false",
+  };
+}
+
 /** pr:status 载荷:link 恒可展示,status 仅在 link 存在且启用时拉取,失败给可读 error。 */
 interface PrStatusPayload {
   enabled: boolean;
@@ -149,8 +181,11 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
     const inspection = await environment.git.inspect(request.repositoryPath);
     const dto = await environment.teamService.startTeam({
       requestID: randomUUID(),
-      // The GUI owns its own single active-run slot, independent of MCP sessions.
-      sessionID: LOCAL_UI_SESSION_ID,
+      // specs/001-v03 T007 (research R1): every GUI start owns an independent
+      // session, so the repository's per-session active-run check no longer
+      // serializes the GUI to a single run — multiple GUI runs may be active
+      // at once. MCP session semantics ("one run per MCP session") untouched.
+      sessionID: `gui-${randomUUID()}`,
       repositoryPath: request.repositoryPath,
       task: request.task,
       baselineCommit: inspection.head,
@@ -576,6 +611,52 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
     });
   });
 
+  // ---- v0.3 运行控制与调度 IPC(specs/001-v03 T011 / interfaces.md B 节)----
+  // 与 MCP 工具共享同一 workbench / teamService(GUI 与 MCP 同构);pause/resume/
+  // set-priority 返回 RunControlDTO 投影(priority + pausedAt,渲染层以
+  // workbench:summary 重载为准),审计事件已由仓储落 relay_events。
+
+  /** 工作台六分区聚合:running/queued/awaiting_input/failed/awaiting_review/integratable。 */
+  handle("workbench:summary", () => environment.workbench.summary());
+
+  /** 暂停 run:停发该 run 新配额,运行中任务照常完成(interfaces.md C 节不变量 4)。 */
+  handle("run:pause", async (payload): Promise<RunControlDTO & { runID: string }> => {
+    const request = payload as { requestID?: string; runID: string };
+    const run = await environment.teamService.pauseRun({
+      requestID: request.requestID ?? randomUUID(),
+      runID: request.runID,
+    });
+    return { runID: run.id, priority: run.priority, pausedAt: run.pausedAt };
+  });
+
+  /** 恢复已暂停 run:drain 镜像 paused_at=null 后,排队任务按优先级继续领配额。 */
+  handle("run:resume", async (payload): Promise<RunControlDTO & { runID: string }> => {
+    const request = payload as { requestID?: string; runID: string };
+    const run = await environment.teamService.resumeRun({
+      requestID: request.requestID ?? randomUUID(),
+      runID: request.runID,
+    });
+    return { runID: run.id, priority: run.priority, pausedAt: run.pausedAt };
+  });
+
+  /** 调整 run 调度优先级(-5..5 整数,越大约先得配额);非整数/越界给可读错误。 */
+  handle("run:set-priority", async (payload): Promise<RunControlDTO & { runID: string }> => {
+    const request = payload as { requestID?: string; runID: string; priority?: unknown };
+    const parsed =
+      typeof request.priority === "number"
+        ? request.priority
+        : Number.parseInt(String(request.priority ?? ""), 10);
+    if (!Number.isInteger(parsed) || parsed < -5 || parsed > 5) {
+      throw new Error("Priority must be an integer between -5 and 5.");
+    }
+    const run = await environment.teamService.setRunPriority({
+      requestID: request.requestID ?? randomUUID(),
+      runID: request.runID,
+      priority: parsed,
+    });
+    return { runID: run.id, priority: run.priority, pausedAt: run.pausedAt };
+  });
+
   handle("agent:check", (payload) => {
     const request = payload as { kind: "claude_code" | "codex" | "pi"; override?: string | null };
     return environment.checkAgent(request.kind, request.override ?? null);
@@ -665,6 +746,36 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
     environment.settings.set(TASK_RETRY_LIMIT_KEY, String(taskRetryLimit));
     environment.settings.set(LAUNCH_STAGGER_SECONDS_KEY, String(launchStaggerSeconds));
     return { taskRetryLimit, launchStaggerSeconds };
+  });
+
+  // 调度设置读写一体(specs/001-v03 B 节,照 execution-policy 的读写一体模式):
+  // 空载荷/六个调度字段全缺 = 读;带任一调度字段 = 全量逐键钳制后写回(调用方
+  // 约定一次提交完整六键,与 execution-policy 相同),两种路径都返回钳定值。
+  handle("scheduler:settings", (payload): SchedulerSettingsPayload => {
+    const request = (payload ?? {}) as Partial<SchedulerSettingsPayload>;
+    const isWrite =
+      request.globalMaxChildren != null ||
+      request.perProjectMaxChildren != null ||
+      request.perKindMaxChildren != null ||
+      request.resourcePauseEnabled != null ||
+      request.minFreeDiskBytes != null ||
+      request.interactiveSlotReserved != null;
+    if (!isWrite) return schedulerSettingsPayload(environment);
+    const next: SchedulerSettingsPayload = {
+      globalMaxChildren: clampGlobalMaxChildren(request.globalMaxChildren),
+      perProjectMaxChildren: clampPerProjectMaxChildren(request.perProjectMaxChildren),
+      perKindMaxChildren: clampPerKindMaxChildren(request.perKindMaxChildren),
+      resourcePauseEnabled: request.resourcePauseEnabled === true,
+      minFreeDiskBytes: clampMinFreeDiskBytes(request.minFreeDiskBytes),
+      interactiveSlotReserved: request.interactiveSlotReserved === true,
+    };
+    environment.settings.set(GLOBAL_MAX_CHILDREN_KEY, String(next.globalMaxChildren));
+    environment.settings.set(PER_PROJECT_MAX_CHILDREN_KEY, String(next.perProjectMaxChildren));
+    environment.settings.set(PER_KIND_MAX_CHILDREN_KEY, String(next.perKindMaxChildren));
+    environment.settings.set(RESOURCE_PAUSE_ENABLED_KEY, next.resourcePauseEnabled ? "true" : "false");
+    environment.settings.set(MIN_FREE_DISK_BYTES_KEY, String(next.minFreeDiskBytes));
+    environment.settings.set(INTERACTIVE_SLOT_RESERVED_KEY, next.interactiveSlotReserved ? "true" : "false");
+    return next;
   });
 
   handle("settings:get-child-models", (): ChildModelsPayload => ({

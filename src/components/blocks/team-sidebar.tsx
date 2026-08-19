@@ -3,7 +3,7 @@
 // Attached block `team-sidebar` adapted: teams = TeamRuns.
 
 import { useState, type ReactNode } from "react";
-import { Archive, ArchiveRestore, Bot, ChevronDown, ChevronRight, ClipboardCheck, Plus, Settings, Users } from "lucide-react";
+import { Archive, ArchiveRestore, Bot, ChevronDown, ChevronRight, ClipboardCheck, LayoutDashboard, Plus, Settings, Users } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { TeamRunSummaryDTO } from "../../../shared/dtos";
@@ -97,6 +97,8 @@ export function TeamSidebar({
   activeRunId,
   onSelectRun,
   onNewRun,
+  onOpenWorkbench,
+  workbenchActive = false,
   onOpenReviewCenter,
   reviewActive = false,
   onOpenSettings,
@@ -109,6 +111,8 @@ export function TeamSidebar({
   activeRunId: string | null;
   onSelectRun: (id: string) => void;
   onNewRun: () => void;
+  onOpenWorkbench: () => void;
+  workbenchActive?: boolean;
   onOpenReviewCenter: () => void;
   reviewActive?: boolean;
   onOpenSettings: () => void;
@@ -232,6 +236,19 @@ export function TeamSidebar({
       </nav>
 
       <div className="border-sidebar-border space-y-0.5 border-t p-2">
+        <button
+          type="button"
+          onClick={onOpenWorkbench}
+          className={cn(
+            "app-no-drag flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors",
+            workbenchActive
+              ? "bg-sidebar-accent text-sidebar-accent-foreground"
+              : "text-sidebar-foreground/80 hover:bg-sidebar-accent/60 hover:text-sidebar-foreground",
+          )}
+        >
+          <LayoutDashboard className="size-4" />
+          工作台
+        </button>
         <button
           type="button"
           onClick={onOpenReviewCenter}

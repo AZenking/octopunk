@@ -24,6 +24,11 @@ import { ChildExecutionService } from "./application/childExecutionService";
 import { TaskIntegrationService } from "./application/taskIntegrationService";
 import { AgentTeamApplicationService } from "./application/agentTeamService";
 import { TeamQueryService } from "./application/teamQueryService";
+import {
+  ConcurrencyBudget,
+  makeSettingsStoreBudgetSettings,
+} from "./application/concurrencyBudget";
+import { WorkbenchService } from "./application/workbenchService";
 import { ContextFetchService } from "./application/contextFetchService";
 import { ReviewCenterService } from "./application/reviewCenterService";
 import { QualityGateService } from "./application/qualityGateService";
@@ -68,6 +73,9 @@ export class AppEnvironment {
   readonly integration: TaskIntegrationService;
   readonly teamService: AgentTeamApplicationService;
   readonly queryService: TeamQueryService;
+  /** 中央并发预算(US4/IPC 呈现四级生效上限的只读投影 getConcurrencyCounts)。 */
+  readonly concurrencyBudget: ConcurrencyBudget;
+  readonly workbench: WorkbenchService;
   readonly reviewCenter: ReviewCenterService;
   readonly qualityGate: QualityGateService;
   readonly reviewModes: ReviewModeService;
@@ -164,6 +172,13 @@ export class AppEnvironment {
         getDiffTree: (runID, taskID, side) => this.reviewCenter.getDiffTree(runID, taskID, side),
       },
     });
+    // 中央并发预算(specs/001-v03 T008):四级联检的单一记账源,构造先于
+    // teamService——后者会在自己的构造里经 setCapacityFreedHandler(ifAbsent)
+    // 把释放/恢复回调接回调度 drain。设置键经 makeSettingsStoreBudgetSettings
+    // 每次现读(SettingsStore 自带内存缓存);settings.string 需保持绑定。
+    this.concurrencyBudget = new ConcurrencyBudget({
+      settings: () => makeSettingsStoreBudgetSettings((key) => this.settings.string(key)),
+    });
     this.teamService = new AgentTeamApplicationService({
       repository: this.repository,
       childExecution: this.childExecution,
@@ -176,8 +191,15 @@ export class AppEnvironment {
       }),
       // accept 前强制门禁判定 + 启动时配置快照(specs/002-v04 B 节 / R4)。
       qualityGate: this.qualityGate,
+      concurrencyBudget: this.concurrencyBudget,
     });
     this.queryService = new TeamQueryService(this.repository);
+    // 全局工作台六分区聚合(US2):结构性端口只取 teamService 的排队原因
+    // 内存态,GUI 与 MCP 同构(interfaces.md B 节 workbench:summary)。
+    this.workbench = new WorkbenchService({
+      repository: this.repository,
+      agentTeamService: this.teamService,
+    });
     // Review Center shares the same repository/git/teamService instances as the
     // MCP tools (constitution principle two) — GUI and MCP stay isomorphic.
     // gh(可选)承担 GitHub PR 回灌用例,未启用时错误在服务层可读透传。
@@ -222,6 +244,7 @@ export class AppEnvironment {
       reviewCenter: this.reviewCenter,
       qualityGate: this.qualityGate,
       reviewModes: this.reviewModes,
+      workbench: this.workbench,
     });
   }
 

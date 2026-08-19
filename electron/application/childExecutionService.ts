@@ -189,6 +189,23 @@ ${reviewSection}
     const taskID = task.id;
     const eventSink = (event: ChildAgentEvent): void => {
       if (repositoryRef == null) return;
+      // T016 PID 持久化:本 sink 是子任务事件管道在 recordTaskExecutionEvent
+      // 之前的唯一消费点,在此拦截适配器上报的 pid 字段并尽力写入
+      // task_attempts.pid(崩溃恢复的核对依据)。task.currentAttemptID 为空
+      // (尚未 markTaskRunning)或写库失败时静默跳过——pid 是尽力而为的
+      // 核对辅助,不得影响事件管道本身。
+      if (event.pid != null) {
+        const pid = event.pid;
+        void repositoryRef
+          .snapshot(runID)
+          .then((snapshot) => {
+            const current = snapshot.tasks.find((candidate) => candidate.id === taskID);
+            const attemptID = current?.currentAttemptID;
+            if (attemptID == null) return;
+            return repositoryRef.updateAttemptPid({ runID, taskID, attemptID, pid });
+          })
+          .catch(() => {});
+      }
       void repositoryRef
         .recordTaskExecutionEvent({ runID, taskID, event })
         .catch(() => {});

@@ -15,6 +15,7 @@ import {
   type ChildAgentReport,
   type InteractiveProcessPort,
   type InteractiveProcessSession,
+  type ProcessPort,
   type ProcessRequest,
 } from "../application/ports";
 
@@ -65,10 +66,11 @@ export class ChildAgentRegistry implements ChildAgentPort {
 /** Codex app-server JSON-RPC adapter: one app-server per turn, thread resumed on REWORK. */
 export class CodexAppServerAdapter implements ChildAgentPort {
   private readonly executablePath: string;
-  private readonly process: InteractiveProcessPort;
+  // T016:pidOf 挂在 ProcessPort 上,组合根(LocalProcessAdapter)两者都实现。
+  private readonly process: InteractiveProcessPort & ProcessPort;
   private readonly sessions = new Map<string, InteractiveProcessSession>();
 
-  constructor(executablePath: string, process_: InteractiveProcessPort) {
+  constructor(executablePath: string, process_: InteractiveProcessPort & ProcessPort) {
     this.executablePath = executablePath;
     this.process = process_;
   }
@@ -128,6 +130,20 @@ export class CodexAppServerAdapter implements ChildAgentPort {
         },
       };
       processSession = await this.process.startInteractive(request, controller.signal);
+      // T016 PID 上报:started 事件在 spawn 之前发出(见上),无法附带 pid,
+      // 因此不挪动它的时序(避免 spawn 失败路径少发 started 的行为变化),而是
+      // 在 startInteractive 成功(spawn 已同步完成)之后紧跟发一个携带 pid 的
+      // 事件。kind 选 output:中性的执行日志事件,不重复触发 taskStarted。
+      // 子进程闪退/判活失败时 pidOf 返回 null,静默跳过。
+      const pid = this.process.pidOf(processID);
+      if (pid != null) {
+        await onEvent({
+          kind: "output",
+          message: `child process pid ${pid}`,
+          sessionID: resumeThreadID,
+          pid,
+        });
+      }
     } catch (error) {
       controller.abort();
       const message = ChildAgentDiagnostics.redact(errorMessage(error), 2048);

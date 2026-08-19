@@ -55,6 +55,10 @@ const FEATURE_TODO = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nTODO: wire up the real cache\n
 type StubProcessBehavior = (request: ProcessRequest, signal?: AbortSignal) => Promise<ProcessResult>;
 
 class StubProcessPort implements ProcessPort {
+  pidOf(): number | null {
+    return null;
+  }
+
   readonly requests: ProcessRequest[] = [];
   behavior: StubProcessBehavior = async () => ({ exitCode: 0, stdout: "", stderr: "" });
 

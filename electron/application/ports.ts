@@ -100,6 +100,11 @@ export interface ChildAgentEvent {
   stderr?: string | null;
   sessionID?: string | null;
   toolName?: string | null;
+  /**
+   * T016:detached 子进程的 OS pid(崩溃恢复的核对依据)。适配器在子进程
+   * spawn 成功后尽力上报;获取失败时不设,消费端静默跳过。
+   */
+  pid?: number;
 }
 
 export type ChildAgentEventSink = (event: ChildAgentEvent) => void | Promise<void>;
@@ -395,6 +400,11 @@ export interface ProcessPort {
     onOutput: (chunk: ProcessOutputChunk) => void,
     signal?: AbortSignal,
   ): Promise<ProcessResult>;
+  /**
+   * T016:processID 对应的存活子进程 OS pid(崩溃恢复核对用);进程未知或
+   * 已退出时返回 null——调用方必须把 null 视为「无从核对」而非「已死亡」。
+   */
+  pidOf(processID: string): number | null;
   terminate(processID: string): Promise<void>;
   terminateAll(): Promise<void>;
 }

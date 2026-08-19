@@ -242,6 +242,26 @@ export class LocalProcessAdapter implements ProcessPort, InteractiveProcessPort 
     this.scheduleForcedTermination(processID);
   }
 
+  pidOf(processID: string): number | null {
+    // T016:复用既有 processID→child 注册表,只读不改。判活是必须的:
+    // ChildProcess.pid 在退出后仍保留旧值,而交互式会话的注册表条目由
+    // 适配器生命周期持有(流式运行则由 runStreaming 的 finally 移除),
+    // 残留条目不能把已死进程的 pid 报给崩溃恢复探活。信号杀死时
+    // exitCode 为 null 而 signalCode 置位;kill() 已发出但 exit 事件尚未
+    // 派发的微小窗口按「垂死」处理,返回 null。
+    const managed = this.processes.get(processID);
+    const child = managed?.child;
+    if (
+      child == null ||
+      child.exitCode != null ||
+      child.signalCode != null ||
+      child.killed
+    ) {
+      return null;
+    }
+    return child.pid ?? null;
+  }
+
   async terminateAll(): Promise<void> {
     for (const processID of [...this.processes.keys()]) {
       await this.terminate(processID);
