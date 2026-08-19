@@ -333,6 +333,13 @@ async function multiRunScenario() {
         baseline_commit: repoInfo.head,
         target_branch: currentBranch(repoInfo.repo),
       });
+      // 串行化场景需要真实集成(写任务才有集成分支);只读任务不触碰目标分支。
+      const mode = flags.sameRepoSerial ? "workspace_write" : flags.mode;
+      // 串行化证明需要任务分支产生真实提交(空写任务的集成是合法空操作)。
+      const scenarioPrompt =
+        flags.sameRepoSerial && flags.prompt == null
+          ? `Create a file named serial-note-${index + 1}.md containing the single word ok, then finish.`
+          : (flags.prompt ?? "Report the repository name you can see and stop.");
       const delegated = await server.call("delegate_tasks", {
         request_id: nextRequestID(`delegate-${index}`),
         context_summary: "multi-run isolation probe",
@@ -340,9 +347,9 @@ async function multiRunScenario() {
           {
             client_key: `multi-${index}`,
             title: `Inspect #${index + 1}`,
-            prompt: flags.prompt ?? "Report the repository name you can see and stop.",
+            prompt: scenarioPrompt,
             agent_kind: flags.agent,
-            execution_mode: flags.mode,
+            execution_mode: mode,
           },
         ],
       });
@@ -364,9 +371,9 @@ async function multiRunScenario() {
 
     if (!flags.accept) {
       console.log("\nDONE (--runs, --no-accept)");
-      return;
     }
 
+    if (flags.accept) {
     step(3, "await reports in parallel");
     await Promise.all(sessions.map((session) => awaitTaskReport(session.server, session.runID, session.taskID)));
     for (const session of sessions) {
@@ -380,13 +387,15 @@ async function multiRunScenario() {
 
     if (flags.sameRepoSerial && sessions.length === 2) {
       step(4, "integration serialization — first complete applies, second must be rejected");
+      const headBefore = runSync(sessions[0].repo, "git rev-parse HEAD").trim();
       const first = await sessions[0].server.call("complete_team", {
         request_id: nextRequestID("complete-0"),
         run_id: sessions[0].runID,
         final_verdict: "PASS",
         summary: "mcp-trace serial first",
       });
-      line(`first  → run status=${first.run.status} (target branch advanced)`);
+      const headAfter = runSync(sessions[0].repo, "git rev-parse HEAD").trim();
+      line(`first  → run status=${first.run.status} target ${headBefore.slice(0, 8)}→${headAfter.slice(0, 8)}${headBefore !== headAfter ? " (advanced)" : " (UNCHANGED — write task did not integrate!)"}`);
       let rejection = null;
       try {
         await sessions[1].server.call("complete_team", {
@@ -418,6 +427,7 @@ async function multiRunScenario() {
       }
     }
     console.log("\nDONE (--runs)");
+    }
   } finally {
     for (const session of sessions) session.server.child.kill("SIGTERM");
     if (!flags.keep) {
@@ -430,8 +440,11 @@ async function multiRunScenario() {
 
 // ---------- main ----------
 
-if (flags.doctor) await doctorScenario();
-if (flags.runs > 0) {
+if ((flags.doctor || flags.runs > 0) && flags.listOnly) {
+  console.log("--list-only: scenario flags ignored (single-run tools/list below)");
+}
+if (flags.doctor && !flags.listOnly) await doctorScenario();
+if (flags.runs > 0 && !flags.listOnly) {
   if (flags.sameRepoSerial && flags.runs !== 2) {
     console.error("--same-repo-serial requires --runs 2");
     process.exit(2);
