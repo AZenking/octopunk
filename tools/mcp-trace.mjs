@@ -94,8 +94,8 @@ for (let index = 2; index < process.argv.length; index += 1) {
       process.exit(2);
   }
 }
-if (!["claude_code", "codex"].includes(flags.agent)) {
-  console.error(`--agent must be claude_code or codex`);
+if (!["claude_code", "codex", "pi"].includes(flags.agent)) {
+  console.error(`--agent must be claude_code, codex or pi`);
   process.exit(2);
 }
 if (!["read_only", "workspace_write"].includes(flags.mode)) {

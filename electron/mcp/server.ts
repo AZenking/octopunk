@@ -20,6 +20,7 @@ import type { ReviewModeService } from "../application/reviewModeService";
 import type { RecoveryService } from "../application/recoveryService";
 import type { DoctorService } from "../application/doctorService";
 import type { GateConfigInput } from "../domain/policy";
+import { CHILD_AGENT_KINDS, type ChildAgentKind } from "../domain/models";
 import { TaskEventHub } from "../domain/events";
 import type { TaskEventUpdate } from "../domain/events";
 import { OctoPunkContextServer } from "../application/ports";
@@ -788,8 +789,12 @@ export function contextToolList(): Tool[] {
 
 type Arguments = Record<string, unknown>;
 
-function requireString(arguments_: Arguments, key: string): string {
-  const value = arguments_[key];
+/** agent_kind 校验(领域常量为单一事实源,新增 Provider 自动放行)。 */
+function isChildAgentKind(value: string): value is ChildAgentKind {
+  return (CHILD_AGENT_KINDS as readonly string[]).includes(value);
+}
+
+function requireString(arguments_: Arguments, key: string): string {  const value = arguments_[key];
   if (typeof value !== "string" || value.length === 0) {
     throw new InvalidParamsError(`Missing string argument: ${key}`);
   }
@@ -917,8 +922,10 @@ async function dispatchTool(
     case "delegate_task": {
       const agentKind = requireString(arguments_, "agent_kind");
       const executionMode = requireString(arguments_, "execution_mode");
-      if (agentKind !== "claude_code" && agentKind !== "codex") {
-        throw new InvalidParamsError("Unsupported agent_kind. Use claude_code or codex.");
+      if (!isChildAgentKind(agentKind)) {
+        throw new InvalidParamsError(
+          `Unsupported agent_kind. Use one of: ${CHILD_AGENT_KINDS.join(", ")}.`,
+        );
       }
       if (executionMode !== "read_only" && executionMode !== "workspace_write") {
         throw new InvalidParamsError("Unsupported execution_mode. Use read_only or workspace_write.");
@@ -1382,8 +1389,10 @@ function taskItems(value: unknown): import("../domain/repositoryPort").DelegateT
     const title = requiredObjectString(object, "title");
     const prompt = requiredObjectString(object, "prompt");
     const rawAgent = object.agent_kind;
-    if (rawAgent !== "claude_code" && rawAgent !== "codex") {
-      throw new InvalidParamsError("Unsupported or missing task agent_kind");
+    if (typeof rawAgent !== "string" || !isChildAgentKind(rawAgent)) {
+      throw new InvalidParamsError(
+        `Unsupported or missing task agent_kind. Use one of: ${CHILD_AGENT_KINDS.join(", ")}.`,
+      );
     }
     const rawMode = object.execution_mode;
     if (rawMode !== "read_only" && rawMode !== "workspace_write") {
