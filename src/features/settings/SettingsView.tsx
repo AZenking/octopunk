@@ -13,6 +13,7 @@ import { AgentsSettings } from "@/features/settings/sections/AgentsSettings";
 import { ConnectionsSettings } from "@/features/settings/sections/ConnectionsSettings";
 import { CustomSettings } from "@/features/settings/sections/CustomSettings";
 import { GateSettings } from "@/features/settings/sections/GateSettings";
+import { DoctorView } from "@/features/doctor/DoctorView";
 
 export function SettingsView({ section }: { section: SettingsSection }) {
   const appState = useAppState();
@@ -40,6 +41,8 @@ export function SettingsView({ section }: { section: SettingsSection }) {
           <ConnectionsSettings />
         ) : section === "gate" ? (
           <GateSettings />
+        ) : section === "doctor" ? (
+          <DoctorView />
         ) : (
           <CustomSettings />
         )}

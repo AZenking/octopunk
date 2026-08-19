@@ -47,12 +47,19 @@ import {
 import type {
   DiffPageDTO,
   DiffTreeEntryDTO,
+  DoctorReportDTO,
   GateConfigDTO,
   GateStartOverrideDTO,
   RunControlDTO,
 } from "../shared/dtos";
 import type { GateConfigInput } from "./domain/policy";
-import { GATE_REVIEW_MODES, type GateReviewMode } from "./domain/models";
+import type { RecoveryCleanupTarget } from "./application/recoveryService";
+import {
+  DOCTOR_CHECK_KEYS,
+  GATE_REVIEW_MODES,
+  type DoctorCheckKey,
+  type GateReviewMode,
+} from "./domain/models";
 
 /** review:run-review 的 mode 参数:六值枚举外给可读错误(领域派发按枚举分派)。 */
 function reviewModeOrThrow(value: string): GateReviewMode {
@@ -60,6 +67,14 @@ function reviewModeOrThrow(value: string): GateReviewMode {
     throw new Error(`Unsupported review mode. Use one of: ${GATE_REVIEW_MODES.join(", ")}.`);
   }
   return value as GateReviewMode;
+}
+
+/** doctor:rerun-item 的 checkKey 参数:九值枚举外给可读错误(单项重检按枚举分派)。 */
+function doctorCheckKeyOrThrow(value: unknown): DoctorCheckKey {
+  if (typeof value !== "string" || !(DOCTOR_CHECK_KEYS as readonly string[]).includes(value)) {
+    throw new Error(`Unsupported doctor check key. Use one of: ${DOCTOR_CHECK_KEYS.join(", ")}.`);
+  }
+  return value as DoctorCheckKey;
 }
 
 export interface RegisteredObservers {
@@ -210,6 +225,8 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
       agentKind: "claude_code" | "codex" | "pi";
       model: string | null;
       executionMode: "read_only" | "workspace_write";
+      /** 交互槽标记(specs/001-v03 T026);缺省 false。 */
+      interactive?: boolean;
     };
     return environment.teamService.delegateTask({
       requestID: randomUUID(),
@@ -220,6 +237,7 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
       model: request.model ?? null,
       executionMode: request.executionMode,
       dependencies: [],
+      interactive: request.interactive === true,
     });
   });
 
@@ -227,13 +245,14 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
     const request = payload as {
       runID: string;
       contextSummary: string;
-      tasks: DelegateTaskItemPayload[];
+      tasks: (DelegateTaskItemPayload & { interactive?: boolean })[];
     };
     return environment.teamService.delegateTasks({
       requestID: randomUUID(),
       runID: request.runID,
       contextSummary: request.contextSummary,
-      tasks: request.tasks,
+      // interactive 归一化为严格布尔(渲染层载荷不做类型保证)。
+      tasks: request.tasks.map((task) => ({ ...task, interactive: task.interactive === true })),
     });
   });
 
@@ -616,6 +635,12 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
   // set-priority 返回 RunControlDTO 投影(priority + pausedAt,渲染层以
   // workbench:summary 重载为准),审计事件已由仓储落 relay_events。
 
+  /**
+   * 资源感知状态(T026/T027):ResourceMonitor 最近一轮采样快照(负载/磁盘/
+   * 是否高压)。只读投影,不触发采样;未完成首轮时 sampledAt=null。
+   */
+  handle("scheduler:resource-status", () => environment.resourceMonitor.latest());
+
   /** 工作台六分区聚合:running/queued/awaiting_input/failed/awaiting_review/integratable。 */
   handle("workbench:summary", () => environment.workbench.summary());
 
@@ -655,6 +680,97 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
       priority: parsed,
     });
     return { runID: run.id, priority: run.priority, pausedAt: run.pausedAt };
+  });
+
+  // ---- v0.3 恢复与体检 IPC(specs/001-v03 T019/T023 / interfaces.md B 节)----
+  // 与 MCP 工具共享同一 RecoveryService / DoctorService(GUI 与 MCP 同构,
+  // 宪法原则二)。恢复类动作全部经显式确认与幂等 requestID 落库留痕;扫描
+  // 只读,启动扫描结果由 AppEnvironment.recoveryStatus 缓存复用一次。
+
+  /** 恢复视图:非终态 run × 进程核对 + 孤儿 worktree/分支扫描(best effort)。 */
+  handle("recovery:status", (payload) => {
+    const request = payload as { runID?: string };
+    return environment.recoveryStatus(request.runID);
+  });
+
+  /** 人工确认后把已死的中断任务标记失败(failTask 幂等;不做任何自动标记)。 */
+  handle("recovery:mark-failed", (payload) => {
+    const request = payload as { requestID?: string; runID: string; taskID: string; reason?: string };
+    return environment.recovery.markInterruptedFailed({
+      requestID: request.requestID ?? randomUUID(),
+      runID: request.runID,
+      taskID: request.taskID,
+      reason: request.reason ?? "",
+    });
+  });
+
+  /** 节点重跑:目标节点复位为 queued,可选连带恢复被阻塞的下游(resumeTask 幂等)。 */
+  handle("recovery:rerun", (payload) => {
+    const request = payload as {
+      requestID?: string;
+      runID: string;
+      taskID: string;
+      includeDownstream?: boolean;
+    };
+    return environment.recovery.rerunTask({
+      requestID: request.requestID ?? randomUUID(),
+      runID: request.runID,
+      taskID: request.taskID,
+      includeDownstream: request.includeDownstream === true,
+    });
+  });
+
+  /** 孤儿清理:必须 confirmed=true(契约 C 节不变量 5);逐项 best effort,失败落 skipped。 */
+  handle("recovery:cleanup-orphans", (payload) => {
+    const request = payload as {
+      requestID?: string;
+      targets: RecoveryCleanupTarget[];
+      confirmed?: boolean;
+    };
+    return environment.recovery.cleanupOrphans({
+      requestID: request.requestID ?? randomUUID(),
+      targets: Array.isArray(request.targets) ? request.targets : [],
+      confirmed: request.confirmed === true,
+    });
+  });
+
+  /** 体检执行(GUI 侧触发来源固定 user);单项超时 → unknown,整体不失败。 */
+  handle("doctor:run", (payload) => {
+    const request = payload as { repositoryPath?: string | null };
+    return environment.doctor.runCheckup({
+      requestID: randomUUID(),
+      repositoryPath: request.repositoryPath ?? null,
+      triggeredBy: "user",
+    });
+  });
+
+  /** 最近体检报告(repositoryPath 省略 = 全局报告;null = 尚无报告)。 */
+  handle("doctor:latest", (payload) => {
+    const request = payload as { repositoryPath?: string | null };
+    return environment.doctor.latestReport(request.repositoryPath ?? null);
+  });
+
+  /** 单项重检:只重跑该检查器并更新对应行,overall 由仓储重算。 */
+  handle("doctor:rerun-item", (payload) => {
+    const request = payload as { requestID?: string; reportID: string; checkKey: unknown };
+    return environment.doctor.rerunItem({
+      requestID: request.requestID ?? randomUUID(),
+      reportID: request.reportID,
+      checkKey: doctorCheckKeyOrThrow(request.checkKey),
+    });
+  });
+
+  /** 脱敏诊断包(FR-013):report 省略时导出最新全局报告;无报告给可读错误。 */
+  handle("doctor:bundle", async (payload): Promise<string> => {
+    const request = payload as { report?: DoctorReportDTO | null };
+    if (request.report != null) {
+      return await environment.doctor.exportDiagnosticBundle(request.report);
+    }
+    const latest = await environment.doctor.latestReport(null);
+    if (latest == null) {
+      throw new Error("还没有可导出的体检报告,请先运行一次体检(doctor:run)。");
+    }
+    return await environment.doctor.exportDiagnosticBundle(latest);
   });
 
   handle("agent:check", (payload) => {

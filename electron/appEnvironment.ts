@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { app } from "electron";
-import { OctoPunkDatabase } from "./data/database";
+import { OctoPunkDatabase, OctoPunkDatabaseMigrator } from "./data/database";
 import { SqliteTeamRunRepository } from "./data/repository";
 import { LocalProcessAdapter, isExecutable } from "./platform/processAdapter";
 import { GitAdapter } from "./platform/gitAdapter";
@@ -20,6 +20,8 @@ import { FilePiConfigAdapter } from "./platform/piConfigAdapter";
 import { FileSkillInstaller } from "./platform/skillInstaller";
 import { MainAppLoginItemAdapter } from "./platform/loginItemAdapter";
 import { NotificationAdapter } from "./platform/notificationAdapter";
+import { DiagnosticsProbes } from "./platform/diagnosticsProbes";
+import { RecoveryCleanup } from "./platform/recoveryCleanup";
 import { ChildExecutionService } from "./application/childExecutionService";
 import { TaskIntegrationService } from "./application/taskIntegrationService";
 import { AgentTeamApplicationService } from "./application/agentTeamService";
@@ -28,11 +30,14 @@ import {
   ConcurrencyBudget,
   makeSettingsStoreBudgetSettings,
 } from "./application/concurrencyBudget";
+import { ResourceMonitor } from "./application/resourceMonitor";
 import { WorkbenchService } from "./application/workbenchService";
 import { ContextFetchService } from "./application/contextFetchService";
 import { ReviewCenterService } from "./application/reviewCenterService";
 import { QualityGateService } from "./application/qualityGateService";
 import { ReviewModeService } from "./application/reviewModeService";
+import { RecoveryService } from "./application/recoveryService";
+import { DoctorService } from "./application/doctorService";
 import { TaskEventHub } from "./domain/events";
 import { OctoPunkMCPServer } from "./mcp/server";
 import {
@@ -45,18 +50,22 @@ import {
   LAUNCH_STAGGER_SECONDS_KEY,
   LEGACY_CLAUDE_EXECUTABLE_KEY,
   MAX_CONCURRENT_TASKS_KEY,
+  MIN_FREE_DISK_BYTES_KEY,
   PI_CHILD_MODEL_KEY,
   PI_EXECUTABLE_KEY,
+  RESOURCE_PAUSE_ENABLED_KEY,
   TASK_RETRY_LIMIT_KEY,
   SettingsStore,
   octoPunkSupportDirectory,
 } from "./settingsStore";
 import {
   clampLaunchStaggerSeconds,
+  clampMinFreeDiskBytes,
   clampTaskRetryLimit,
   DEFAULT_MAX_CONCURRENT_TASKS,
   MAX_CONCURRENT_TASKS_LIMIT,
 } from "../shared/ipc";
+import type { RecoveryStatusDTO } from "../shared/dtos";
 import { ChildAgentDiagnostics, type ChildAgentAvailability } from "./application/ports";
 
 export class AppEnvironment {
@@ -75,10 +84,16 @@ export class AppEnvironment {
   readonly queryService: TeamQueryService;
   /** 中央并发预算(US4/IPC 呈现四级生效上限的只读投影 getConcurrencyCounts)。 */
   readonly concurrencyBudget: ConcurrencyBudget;
+  /** 资源感知监控(T026):5s 采样负载/磁盘,高压即预算暂缓新配额。 */
+  readonly resourceMonitor: ResourceMonitor;
   readonly workbench: WorkbenchService;
   readonly reviewCenter: ReviewCenterService;
   readonly qualityGate: QualityGateService;
   readonly reviewModes: ReviewModeService;
+  /** 崩溃恢复编排(specs/001-v03 T019):只读扫描 + 显式确认的人工恢复动作。 */
+  readonly recovery: RecoveryService;
+  /** 环境体检(specs/001-v03 T023):九项检查/单项重检/诊断包/启动拦截。 */
+  readonly doctor: DoctorService;
   readonly contextFetch: ContextFetchService;
   readonly eventHub: TaskEventHub;
   readonly keychain: KeychainTokenStore;
@@ -234,6 +249,52 @@ export class AppEnvironment {
     this.loginItem = new MainAppLoginItemAdapter();
     this.notifications = new NotificationAdapter();
     this.contextFetch = new ContextFetchService(this.repository);
+    // 恢复与体检(specs/001-v03 T019/T023)共享同一 repository/process/git
+    // 实例与探针(GUI 与 MCP 同构,宪法原则二)。清理端口的守护规则在平台
+    // 实现内:removePath 限 OctoPunk 托管根且拒绝符号链接逃逸,deleteBranch
+    // 只允许 octopunk/ 前缀。
+    const diagnosticsProbes = new DiagnosticsProbes();
+    // 资源感知调度(T026 / research R6):定时采样 loadavg + worktree 根磁盘
+    // 余量,高压即经预算闸门暂缓新配额(运行中不受影响),恢复触发全局重排。
+    // GUI 与 --mcp-stdio 两种进程形态都经本组合根构造,监控随之都启动(静默:
+    // 不注入 logger,采样/推送不打日志);定时器 unref 不阻塞退出。设置两键
+    // 每次现读(scheduler:settings 写入即刻生效)。
+    this.resourceMonitor = new ResourceMonitor({
+      probes: diagnosticsProbes,
+      budget: this.concurrencyBudget,
+      // doctor worktree_disk 同一托管根(Application Support/OctoPunk/worktrees)。
+      paths: { worktreeRoot: () => path.join(octoPunkSupportDirectory(), "worktrees") },
+      settings: () => ({
+        resourcePauseEnabled: this.settings.string(RESOURCE_PAUSE_ENABLED_KEY) !== "false",
+        minFreeDiskBytes: clampMinFreeDiskBytes(this.settings.string(MIN_FREE_DISK_BYTES_KEY)),
+      }),
+    });
+    this.resourceMonitor.start();
+    this.recovery = new RecoveryService({
+      repository: this.repository,
+      probes: diagnosticsProbes,
+      processPort: this.process,
+      // 结构切片:恢复重跑后仅借用调度器既有的 drain 入口补发配额。
+      teamService: { drainReadyTasks: (runID) => this.teamService.drainReadyTasks(runID) },
+      cleanup: new RecoveryCleanup(this.process),
+    });
+    this.doctor = new DoctorService({
+      repository: this.repository,
+      // 结构切片:DoctorAgentsPort.check → AppEnvironment.checkAgent。
+      agents: {
+        check: (kind, override) => this.checkAgent(kind, override),
+      },
+      git: this.git,
+      probes: diagnosticsProbes,
+      // db.health 复用现有 writer 连接(schema 版本 + PRAGMA quick_check)。
+      db: this.database,
+      selfExecutable: () => resolveSelfExecutable(),
+      env: process.env,
+      // gitAdapter.taskWorktreeRoot 的托管根(Application Support/OctoPunk/worktrees)。
+      worktreeRoot: () => path.join(octoPunkSupportDirectory(), "worktrees"),
+      expectedSchemaVersion: OctoPunkDatabaseMigrator.currentVersion,
+      minFreeBytes: clampMinFreeDiskBytes(this.settings.string(MIN_FREE_DISK_BYTES_KEY)),
+    });
     this.mcpServer = new OctoPunkMCPServer({
       service: this.teamService,
       git: this.git,
@@ -245,7 +306,37 @@ export class AppEnvironment {
       qualityGate: this.qualityGate,
       reviewModes: this.reviewModes,
       workbench: this.workbench,
+      recovery: this.recovery,
+      doctor: this.doctor,
     });
+    // 启动恢复扫描(specs/001-v03 T019):构造完成后异步触发一次,不 await、
+    // 失败静默;结果缓存给 UI 首次 recovery:status 拉取(见 recoveryStatus)。
+    // 纯只读扫描——不做任何自动失败标记/清理,恢复动作一律人可控。
+    const startupRecoveryScan = this.recovery.scan();
+    startupRecoveryScan.catch(() => {});
+    this.startupRecoveryScan = startupRecoveryScan;
+  }
+
+  /** 启动恢复扫描缓存(首次全局 recovery:status 复用;消费后置空,之后现扫)。 */
+  private startupRecoveryScan: Promise<RecoveryStatusDTO> | null = null;
+
+  /**
+   * 恢复视图读取入口(IPC recovery:status):首次全局拉取复用启动扫描,
+   * 之后每次现扫;runID 范围请求始终现扫(启动扫描是全局视图)。
+   */
+  async recoveryStatus(runID?: string): Promise<RecoveryStatusDTO> {
+    if (runID == null) {
+      const cached = this.startupRecoveryScan;
+      this.startupRecoveryScan = null;
+      if (cached != null) {
+        try {
+          return await cached;
+        } catch {
+          // 启动扫描异常(scan 自身 best-effort,基本不可达)→ 现扫兜底。
+        }
+      }
+    }
+    return await this.recovery.scan(runID == null ? undefined : { runID });
   }
 
   async checkAgent(

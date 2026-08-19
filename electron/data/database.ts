@@ -442,4 +442,22 @@ export class OctoPunkDatabase {
     }
     return OctoPunkDatabase.open(databaseURL);
   }
+
+  /**
+   * v0.3 体检只读健康快照(T023):schema 版本(当前迁移器口径)+ PRAGMA
+   * quick_check 结果映射("ok" → true,其余输出 → false,无法执行 → null)。
+   * 复用现有 writer 连接,不开新句柄。
+   */
+  health(): { version: number; quickCheck: boolean | null } {
+    const version = OctoPunkDatabaseMigrator.readVersion(this.writer);
+    try {
+      const result = this.writer.pragma("quick_check", { simple: true }) as unknown;
+      return {
+        version,
+        quickCheck: typeof result === "string" ? result.trim().toLowerCase() === "ok" : null,
+      };
+    } catch {
+      return { version, quickCheck: null };
+    }
+  }
 }

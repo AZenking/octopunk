@@ -65,10 +65,10 @@ description: "Task list for v0.3 稳定性与多任务运行"
 
 - [x] T016 [US2] PID 持久化:`LocalProcessAdapter`/适配器链路把子进程 PID 写入 attempt(updateAttemptPid),正常退出清除;若 runStreaming 未暴露 PID 则最小扩展 ProcessPort(research R4)
 - [x] T017 [P] [US2] 平台探测:`electron/platform/diagnosticsProbes.ts` —— 进程探活(ps 按 PID,只认带 octopunk 标识的命令行)、孤儿 worktree/临时分支扫描(对照 DB 登记)、磁盘 statfs 与负载采样(US3/US4 复用);全部经端口类型导出供服务注入
-- [ ] T018 [US2] 恢复服务:`electron/application/recoveryService.ts` —— 启动扫描(非终态 run 的 running 任务→探活分类:进程仍在/已死)、恢复视图聚合、孤儿清单与显式确认清理、rerunTask(include_downstream 下游重置,复用 resumeTask 语义)、全部 recovery.action 审计(deps: T005, T017)
-- [ ] T019 [US2] 接线:`electron/appEnvironment.ts` 启动后异步扫描(不打断启动);MCP get_recovery_status/rerun_task + IPC recovery:status/rerun/cleanup-orphans(清理需显式 confirm)(deps: T018)
-- [ ] T020 [P] [US2] 恢复视图 UI:工作台「执行失败/等待输入」分区入口或运行详情内恢复区 —— 进程仍在标注、失败原因(五类)、重跑(含下游 Switch)、孤儿清理确认 Dialog(deps: T019)
-- [ ] T021 [US2] tests/recovery.test.ts:扫描分类、孤儿确认清理留痕、rerun 下游重置且无关任务不动、清理需 confirm(deps: T018)
+- [x] T018 [US2] 恢复服务:`electron/application/recoveryService.ts` —— 启动扫描(非终态 run 的 running 任务→探活分类:进程仍在/已死)、恢复视图聚合、孤儿清单与显式确认清理、rerunTask(include_downstream 下游重置,复用 resumeTask 语义)、全部 recovery.action 审计(deps: T005, T017)
+- [x] T019 [US2] 接线:`electron/appEnvironment.ts` 启动后异步扫描(不打断启动);MCP get_recovery_status/rerun_task + IPC recovery:status/rerun/cleanup-orphans(清理需显式 confirm)(deps: T018)
+- [x] T020 [P] [US2] 恢复视图 UI:工作台「执行失败/等待输入」分区入口或运行详情内恢复区 —— 进程仍在标注、失败原因(五类)、重跑(含下游 Switch)、孤儿清理确认 Dialog(deps: T019)
+- [x] T021 [US2] tests/recovery.test.ts:扫描分类、孤儿确认清理留痕、rerun 下游重置且无关任务不动、清理需 confirm(deps: T018)
 
 ---
 
@@ -78,10 +78,10 @@ description: "Task list for v0.3 稳定性与多任务运行"
 
 **Independent Test**: quickstart 场景 3 —— 注入 PATH/脏工作区故障被检出,修复后单项重检转 pass,诊断包无敏感内容。
 
-- [ ] T022 [US3] 体检服务:`electron/application/doctorService.ts` —— 九项检查器注册表(cli_path/gui_path/login/mcp_stdio/git_repo/worktree_disk/sandbox/provider_quota/db_health),单项超时(5s)→unknown,overall fail/degraded/pass;报告落库、单项重检、脱敏诊断包导出;检查器依赖经端口注入(checkAgent、git.inspect、probes、db 健康)(deps: T005, T017)
-- [ ] T023 [P] [US3] 通道:MCP run_doctor/get_doctor_report + IPC doctor:run/latest/rerun-item(deps: T022)
-- [ ] T024 [P] [US3] DoctorView UI:九项三态列表(影响/建议/耗时)、单项重检按钮、诊断包复制;start_team 注定失败拦截(仓库不存在/CLI 不可用→指向诊断项)(deps: T023)
-- [ ] T025 [US3] tests/doctor.test.ts:三态与 overall 规则、超时 unknown、单项重检只重跑该项、诊断包 redact、拦截判定(deps: T022)
+- [x] T022 [US3] 体检服务:`electron/application/doctorService.ts` —— 九项检查器注册表(cli_path/gui_path/login/mcp_stdio/git_repo/worktree_disk/sandbox/provider_quota/db_health),单项超时(5s)→unknown,overall fail/degraded/pass;报告落库、单项重检、脱敏诊断包导出;检查器依赖经端口注入(checkAgent、git.inspect、probes、db 健康)(deps: T005, T017)
+- [x] T023 [P] [US3] 通道:MCP run_doctor/get_doctor_report + IPC doctor:run/latest/rerun-item(deps: T022)
+- [x] T024 [P] [US3] DoctorView UI:九项三态列表(影响/建议/耗时)、单项重检按钮、诊断包复制;start_team 注定失败拦截(仓库不存在/CLI 不可用→指向诊断项)(deps: T023)
+- [x] T025 [US3] tests/doctor.test.ts:三态与 overall 规则、超时 unknown、单项重检只重跑该项、诊断包 redact、拦截判定(deps: T022)
 
 ---
 
@@ -91,9 +91,9 @@ description: "Task list for v0.3 稳定性与多任务运行"
 
 **Independent Test**: quickstart 场景 4 —— 阈值触发高压后新任务排队(resource_pressure),运行中任务完成;阈值恢复后自动放行;交互槽先启。
 
-- [ ] T026 [US4] 资源监控:`electron/application/resourceMonitor.ts` —— 5s 采样(探针注入)、高压判定(尽力而为,探测失败=未知不阻塞)、事件联动 concurrencyBudget 暂缓/恢复;交互槽预留(全局配额保留 1 给 interactive 任务,委派时可标记)(deps: T008, T017)
-- [ ] T027 [US4] 贯通与设置:排队原因展示(工作台/运行详情显示 resource_pressure/交互槽状态)+ 设置区资源阈值/开关 UI(deps: T011, T026)
-- [ ] T028 [US4] tests(扩展 concurrency.test.ts):高压暂缓不伤运行中、恢复自动放行(时钟快进)、交互槽优先(deps: T026)
+- [x] T026 [US4] 资源监控:`electron/application/resourceMonitor.ts` —— 5s 采样(探针注入)、高压判定(尽力而为,探测失败=未知不阻塞)、事件联动 concurrencyBudget 暂缓/恢复;交互槽预留(全局配额保留 1 给 interactive 任务,委派时可标记)(deps: T008, T017)
+- [x] T027 [US4] 贯通与设置:排队原因展示(工作台/运行详情显示 resource_pressure/交互槽状态)+ 设置区资源阈值/开关 UI(deps: T011, T026)
+- [x] T028 [US4] tests(扩展 concurrency.test.ts):高压暂缓不伤运行中、恢复自动放行(时钟快进)、交互槽优先(deps: T026)
 
 ---
 

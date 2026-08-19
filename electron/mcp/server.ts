@@ -17,13 +17,16 @@ import type { GitDiffSide, GitPort, KeychainPort } from "../application/ports";
 import type { ReviewCenterService, ReviewCommentInput } from "../application/reviewCenterService";
 import type { QualityGateService } from "../application/qualityGateService";
 import type { ReviewModeService } from "../application/reviewModeService";
+import type { RecoveryService } from "../application/recoveryService";
+import type { DoctorService } from "../application/doctorService";
 import type { GateConfigInput } from "../domain/policy";
 import { TaskEventHub } from "../domain/events";
 import type { TaskEventUpdate } from "../domain/events";
 import { OctoPunkContextServer } from "../application/ports";
 import { stableStringify } from "../domain/events";
 import { GATE_REVIEW_MODES, type GateReviewMode, type ReviewFinding } from "../domain/models";
-import { RUN_PRIORITY_MIN, RUN_PRIORITY_MAX } from "../domain/models";
+import { DOCTOR_TRIGGERED_BY, RUN_PRIORITY_MIN, RUN_PRIORITY_MAX } from "../domain/models";
+import type { DoctorTriggeredBy } from "../domain/models";
 import { randomReviewFindingID } from "./ids";
 import { OctoPunkHTTPApplication } from "./httpApplication";
 
@@ -77,6 +80,13 @@ export class OctoPunkMCPServer {
      * tool becomes available (same instance the IPC channel uses).
      */
     workbench?: AgentTeamServicePortLike["workbench"];
+    /** Recovery service; when present the recovery tools become available. */
+    recovery?: RecoveryService | null;
+    /**
+     * Doctor service; when present the doctor tools become available and
+     * start_team consults its prestart blockers.
+     */
+    doctor?: DoctorService | null;
   }) {
     // Prototype-chain delegation keeps reads live against the underlying
     // service instance while exposing the optional reviewCenter field.
@@ -88,6 +98,9 @@ export class OctoPunkMCPServer {
     this.service.reviewModes = input.reviewModes ?? undefined;
     // Same delegation pattern for the workbench aggregate service (see above).
     this.service.workbench = input.workbench ?? undefined;
+    // Same delegation pattern for the recovery / doctor services (see above).
+    this.service.recovery = input.recovery ?? undefined;
+    this.service.doctor = input.doctor ?? undefined;
     this.git = input.git;
     this.keychain = input.keychain;
     this.eventHub = input.eventHub ?? null;
@@ -289,6 +302,9 @@ function integerSchema(): Record<string, unknown> {
 function arraySchema(): Record<string, unknown> {
   return { type: "array", items: { type: "string" } };
 }
+function booleanSchema(): Record<string, unknown> {
+  return { type: "boolean" };
+}
 function taskReferenceSchema(): Record<string, unknown> {
   return {
     type: "object",
@@ -325,6 +341,7 @@ function delegateTasksSchema(): Record<string, unknown> {
         execution_mode: stringSchema(),
         parent_task: taskReferenceSchema(),
         dependencies: { type: "array", items: taskReferenceSchema() },
+        interactive: booleanSchema(),
       },
       required: ["client_key", "title", "prompt", "agent_kind", "execution_mode"],
     },
@@ -431,6 +448,7 @@ export function fullToolList(): Tool[] {
         model: stringSchema(),
         execution_mode: stringSchema(),
         dependencies: arraySchema(),
+        interactive: booleanSchema(),
       },
       ["request_id", "title", "prompt", "agent_kind", "execution_mode"],
     ),
@@ -704,6 +722,39 @@ export function fullToolList(): Tool[] {
       { request_id: stringSchema(), run_id: stringSchema() },
       ["request_id"],
     ),
+    tool(
+      "get_recovery_status",
+      "Read the crash-recovery view: process reconciliation of running tasks (dead / reused / alive-but-detached / unknown), orphan worktrees and orphan branches under the OctoPunk managed roots. Read-only — no task is ever auto-failed; every recovery action stays behind explicit human confirmation.",
+      { run_id: stringSchema() },
+      [],
+    ),
+    tool(
+      "rerun_task",
+      `Rerun a failed/blocked/cancelled task node: flips it back to queued through the normal dependency gate; include_downstream additionally resumes blocked descendants (queued descendants need no reset). Returns the reset tasks. ${runIDNote}`,
+      {
+        request_id: stringSchema(),
+        run_id: stringSchema(),
+        task_id: stringSchema(),
+        include_downstream: { type: "boolean", description: "Default false." },
+      },
+      ["request_id", "task_id"],
+    ),
+    tool(
+      "run_doctor",
+      "Run the nine-check environment doctor (agent CLIs, GUI PATH, login state, MCP stdio self-launch, git repo state, worktree disk, sandbox, provider quota, database health). Each item has its own timeout and degrades to unknown instead of failing the whole report.",
+      {
+        request_id: stringSchema(),
+        repository_path: stringSchema(),
+        triggered_by: { type: "string", enum: [...DOCTOR_TRIGGERED_BY], description: "Default user." },
+      },
+      ["request_id"],
+    ),
+    tool(
+      "get_doctor_report",
+      "Read the most recent doctor report for one repository (omit repository_path for the global report), or null when none exists yet.",
+      { repository_path: stringSchema() },
+      [],
+    ),
   ];
 }
 
@@ -834,6 +885,17 @@ async function dispatchTool(
     case "start_team": {
       const requestID = requireString(arguments_, "request_id");
       const repositoryPath = requireString(arguments_, "repository_path");
+      // 体检预启动拦截(specs/001-v03 FR-014 / T023):「注定失败」级阻塞项
+      // (仓库不可用 / 全部 CLI 不可用)在排队前拒绝并列出中文原因;探测
+      // 超时按「无法确认」放行,交给完整体检呈现。doctor 未接线时不拦截。
+      if (service.doctor != null) {
+        const blockers = await service.doctor.prestartBlockers(repositoryPath);
+        if (blockers.length > 0) {
+          throw new Error(
+            `start_team 已被体检查出注定失败的原因而拒绝:${blockers.join(";")}。请先运行 run_doctor 查看完整诊断。`,
+          );
+        }
+      }
       const inspection = await git.inspect(repositoryPath);
       const baseline = optionalString(arguments_, "baseline_commit") ?? inspection.head;
       const targetBranch = optionalString(arguments_, "target_branch") ?? inspection.branchName ?? "";
@@ -870,6 +932,8 @@ async function dispatchTool(
         model: optionalModel(arguments_.model),
         executionMode,
         dependencies: uuidArray(arguments_, "dependencies"),
+        // 交互槽标记(specs/001-v03 T026):缺省 false,共享配额。
+        interactive: arguments_.interactive === true,
       });
       return stableStringify(result);
     }
@@ -1236,6 +1300,44 @@ async function dispatchTool(
       await service.unarchiveTeam({ requestID: requireString(arguments_, "request_id"), runID });
       return stableStringify({ runID, archived: false });
     }
+    case "get_recovery_status": {
+      const recovery = requireRecovery(service);
+      const runID = optionalUUID(arguments_, "run_id");
+      return stableStringify(await recovery.scan(runID == null ? undefined : { runID }));
+    }
+    case "rerun_task": {
+      const recovery = requireRecovery(service);
+      const rawDownstream = arguments_.include_downstream;
+      if (rawDownstream != null && typeof rawDownstream !== "boolean") {
+        throw new InvalidParamsError("include_downstream must be a boolean (default false).");
+      }
+      const tasks = await recovery.rerunTask({
+        requestID: requireString(arguments_, "request_id"),
+        runID: await resolveRunID(service, arguments_, sessionID),
+        taskID: requireUUID(arguments_, "task_id"),
+        includeDownstream: rawDownstream === true,
+      });
+      return stableStringify(tasks);
+    }
+    case "run_doctor": {
+      const doctor = requireDoctor(service);
+      const rawTrigger = optionalString(arguments_, "triggered_by") ?? "user";
+      if (!(DOCTOR_TRIGGERED_BY as readonly string[]).includes(rawTrigger)) {
+        throw new InvalidParamsError(
+          `Unsupported triggered_by. Use one of: ${DOCTOR_TRIGGERED_BY.join(", ")}.`,
+        );
+      }
+      const report = await doctor.runCheckup({
+        requestID: requireString(arguments_, "request_id"),
+        repositoryPath: optionalString(arguments_, "repository_path") ?? null,
+        triggeredBy: rawTrigger as DoctorTriggeredBy,
+      });
+      return stableStringify(report);
+    }
+    case "get_doctor_report": {
+      const doctor = requireDoctor(service);
+      return stableStringify(await doctor.latestReport(optionalString(arguments_, "repository_path") ?? null));
+    }
     default:
       throw new Error(`Method not found: ${name}`);
   }
@@ -1300,6 +1402,8 @@ function taskItems(value: unknown): import("../domain/repositoryPort").DelegateT
       executionMode: rawMode,
       parentTask,
       dependencies,
+      // 交互槽标记(specs/001-v03 T026):缺省 false,共享配额。
+      interactive: object.interactive === true,
     };
   });
 }
@@ -1395,6 +1499,22 @@ function requireWorkbench(service: AgentTeamServicePortLike): NonNullable<AgentT
     throw new Error("Workbench tool is unavailable: the workbench service is not wired in this build.");
   }
   return service.workbench;
+}
+
+/** Recovery tools share the team service port; until appEnvironment wires the instance they answer with a readable error. */
+function requireRecovery(service: AgentTeamServicePortLike): RecoveryService {
+  if (service.recovery == null) {
+    throw new Error("Recovery tools are unavailable: the recovery service is not wired in this build.");
+  }
+  return service.recovery;
+}
+
+/** Doctor tools share the team service port; until appEnvironment wires the instance they answer with a readable error. */
+function requireDoctor(service: AgentTeamServicePortLike): DoctorService {
+  if (service.doctor == null) {
+    throw new Error("Doctor tools are unavailable: the doctor service is not wired in this build.");
+  }
+  return service.doctor;
 }
 
 /** run_review 的轮询节奏(与 ReviewModeService.collectArbitration 内部节奏一致)。 */

@@ -22,6 +22,8 @@ import type { TeamRun } from "../domain/models";
 import type { ReviewCenterService } from "../application/reviewCenterService";
 import type { QualityGateService } from "../application/qualityGateService";
 import type { ReviewModeService } from "../application/reviewModeService";
+import type { RecoveryService } from "../application/recoveryService";
+import type { DoctorService } from "../application/doctorService";
 
 /** Read-only live context supply for sub-agents (spec 001 FR-005…FR-008). */
 export interface ReadOnlyContextPort {
@@ -113,4 +115,18 @@ export interface AgentTeamServicePortLike {
    * with a readable error instead of failing to build.
    */
   reviewModes?: ReviewModeService;
+  /**
+   * Recovery use cases (crash-recovery view, interrupted-task handling, node
+   * rerun) shared by GUI and MCP (constitution principle two); appEnvironment
+   * wires the same instance the IPC channel uses. Optional: until then the
+   * recovery tools answer with a readable error instead of failing to build.
+   */
+  recovery?: RecoveryService;
+  /**
+   * Doctor use cases (nine-check environment doctor, per-item rerun, prestart
+   * blockers) shared by GUI and MCP (constitution principle two). Optional
+   * like recovery: until appEnvironment wires the instance the doctor tools
+   * answer with a readable error, and start_team skips the prestart gate.
+   */
+  doctor?: DoctorService;
 }

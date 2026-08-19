@@ -50,6 +50,11 @@ export interface DelegateTaskInput {
   model: string | null;
   executionMode: TaskExecutionMode;
   dependencies: string[];
+  /**
+   * Delegation-time interactive flag (specs/001-v03 T026): lets the launch gate
+   * count the task against the globally reserved interactive slot. Default false.
+   */
+  interactive?: boolean;
 }
 
 export interface TaskReference {
@@ -71,6 +76,8 @@ export interface DelegateTaskItemInput {
   executionMode: TaskExecutionMode;
   parentTask: TaskReference | null;
   dependencies: TaskReference[];
+  /** Interactive-slot eligible (specs/001-v03 T026); default false. */
+  interactive?: boolean;
 }
 
 export interface DelegateTasksInput {
@@ -496,6 +503,12 @@ export interface TeamRunRepository {
     attemptID: string;
     pid: number | null;
   }): Promise<void>;
+  /**
+   * The task's current attempt PID (child_tasks.current_attempt_id →
+   * task_attempts.pid) — the read side of the crash-recovery process
+   * reconciliation. Null when the task has no attempt / no PID recorded.
+   */
+  attemptPid(input: { runID: string; taskID: string }): Promise<number | null>;
 }
 
 export type { TeamRun, TaskExecutionReport };

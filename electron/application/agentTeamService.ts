@@ -129,6 +129,12 @@ export class AgentTeamApplicationService {
   private readonly concurrencyBudget?: ConcurrencyBudget;
   /** queued 任务的排队原因(闸门拒绝级别);任务获配额/终态时清除。 */
   private queueReasons = new Map<string, { runID: string; reason: QueueReasonDTO }>();
+  /**
+   * 委派期 interactive 标记(specs/001-v03 T026):launch 闸门据此让任务使用
+   * 全局预留交互槽。内存态(调度期派生信息,不落库),任务终态/停机时清除;
+   * 进程重启后标记丢失,任务回到共享配额(安全默认,交互槽只影响准入先后)。
+   */
+  private interactiveTaskIDs = new Set<string>();
   /** Runs the scheduler has drained at least once; drives global re-drain on freed capacity. */
   private knownRunIDs = new Set<string>();
 
@@ -189,6 +195,7 @@ export class AgentTeamApplicationService {
 
   async delegateTask(input: DelegateTaskInput): Promise<import("../../shared/dtos").ChildTaskDTO> {
     const task = await this.repository.delegateTask(input);
+    if (input.interactive === true) this.interactiveTaskIDs.add(task.id);
     this.startEventMonitor(input.runID);
     await this.launchReadyTasks(input.runID);
     return childTaskDTO(task);
@@ -196,6 +203,10 @@ export class AgentTeamApplicationService {
 
   async delegateTasks(input: DelegateTasksInput): Promise<import("../../shared/dtos").DelegateTasksResultDTO> {
     const result = await this.repository.delegateTasks(input);
+    // createTaskBatch 按输入顺序返回 tasks,按下标对齐 interactive 标记。
+    result.tasks.forEach((task, index) => {
+      if (input.tasks[index]?.interactive === true) this.interactiveTaskIDs.add(task.id);
+    });
     this.startEventMonitor(input.runID);
     await this.launchReadyTasks(input.runID);
     return delegateTasksResultDTO(result);
@@ -592,8 +603,11 @@ export class AgentTeamApplicationService {
       if (!precheck.granted) {
         this.recordQueueReason(task.id, runID, precheck.reason);
         // Only kind_budget blocks solely this agent kind; every other level
-        // (global/project/run/pressure/paused) saturates the whole run's queue.
-        if (precheck.reason !== "kind_budget") break;
+        // (project/run/pressure/paused) saturates the whole run's queue.
+        // global_budget additionally continues: the interactive reservation
+        // (T026) can still admit a later interactive task past a denied
+        // non-interactive one (quickstart 场景 4:预留槽先于排队批任务启动)。
+        if (precheck.reason !== "kind_budget" && precheck.reason !== "global_budget") break;
         continue;
       }
       this.recordQueueReason(task.id, runID, null);
@@ -608,7 +622,8 @@ export class AgentTeamApplicationService {
         const recheck = this.consultBudget(task, current.run);
         if (!recheck.granted) {
           this.recordQueueReason(task.id, runID, recheck.reason);
-          if (recheck.reason !== "kind_budget") break;
+          // 与 precheck 同一语义:global_budget 继续扫(interactive 预留槽)。
+          if (recheck.reason !== "kind_budget" && recheck.reason !== "global_budget") break;
           continue;
         }
         this.recordQueueReason(task.id, runID, null);
@@ -849,6 +864,7 @@ export class AgentTeamApplicationService {
     this.childWork.delete(taskID);
     this.childRunIDs.delete(taskID);
     this.queueReasons.delete(taskID);
+    this.interactiveTaskIDs.delete(taskID);
     // release() fires the capacity-freed callback (global re-drain); the
     // explicit same-run drain below keeps the no-budget path unchanged.
     this.concurrencyBudget?.release(runID, taskID);
@@ -976,8 +992,9 @@ export class AgentTeamApplicationService {
       repositoryPath: run.repositoryPath,
       agentKind: task.agentKind,
       runMaxConcurrentTasks: run.maxConcurrentTasks,
-      // 委派期 interactive 标记属 T026;当前所有常规任务都走共享配额。
-      interactive: false,
+      // 委派期 interactive 标记(T026):delegateTask/DelegateTasks 透传,预留槽
+      // 只影响闸门准入,不改运行语义。
+      interactive: this.interactiveTaskIDs.has(task.id),
     };
   }
 
@@ -1048,6 +1065,7 @@ export class AgentTeamApplicationService {
     this.childWork.delete(task.id);
     this.childRunIDs.delete(task.id);
     this.queueReasons.delete(task.id);
+    this.interactiveTaskIDs.delete(task.id);
     // No-op for tasks that never launched (stop sweeps whole runs too).
     this.concurrencyBudget?.release(task.runID, task.id);
   }

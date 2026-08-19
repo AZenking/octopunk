@@ -30,6 +30,8 @@ import {
   makeSettingsStoreBudgetSettings,
   type ConcurrencyBudgetSettings,
 } from "../electron/application/concurrencyBudget";
+import { ResourceMonitor } from "../electron/application/resourceMonitor";
+import { DEFAULT_MIN_FREE_DISK_BYTES } from "../shared/ipc";
 import {
   ChildAgentExecutionError,
   type ChildAgentReport,
@@ -769,6 +771,100 @@ describe("交互槽预留", () => {
       reason: "global_budget",
     });
   }, 30000);
+
+  it("delegate 载荷 interactive 贯穿 launch 闸门:共享槽占满时 interactive 委派任务仍先启动(T026 委派链路)", async () => {
+    const world = await buildWorld({
+      prefix: "interactive-flow",
+      settings: {
+        [GLOBAL_MAX_CHILDREN_KEY]: "2",
+        [INTERACTIVE_SLOT_RESERVED_KEY]: "true",
+      },
+    });
+    const repo = world.repos[0];
+    const first = await delegate(world, 0, { requestID: "iflow-t1", title: "Normal one" });
+    await waitStatus(world, repo.run.id, first, "running");
+
+    // 普通任务只能用 2-1=1 个共享槽:第二个普通任务排队 global_budget。
+    const second = await delegate(world, 0, {
+      requestID: "iflow-t2",
+      title: "Normal two",
+      agentKind: "codex",
+    });
+    await waitStatus(world, repo.run.id, second, "queued");
+    expect(queueReasonOf(world, repo.run.id, second)).toBe("global_budget");
+
+    // 单任务委派带 interactive:true → launch 的 budgetTask 收到 interactive,
+    // 走全局预留槽启动(共享槽已被 first 占满)。
+    const interactiveSingle = await world.service.delegateTask({
+      requestID: "iflow-t3",
+      runID: repo.run.id,
+      title: "Interactive single",
+      prompt: "Interactive single",
+      agentKind: "claude_code",
+      model: null,
+      executionMode: "read_only",
+      dependencies: [],
+      interactive: true,
+    });
+    await waitStatus(world, repo.run.id, interactiveSingle.id, "running");
+    expect(queueReasonOf(world, repo.run.id, interactiveSingle.id)).toBeNull();
+    expect(world.service.getConcurrencyCounts()?.global).toMatchObject({
+      active: 2,
+      limit: 2,
+      interactiveReserved: true,
+    });
+
+    // 批量委派:interactive 项启动,普通项保持排队(按 index 对齐标记)。
+    const batch = await world.service.delegateTasks({
+      requestID: "iflow-batch",
+      runID: repo.run.id,
+      contextSummary: "",
+      tasks: [
+        {
+          clientKey: "interactive-item",
+          title: "Interactive item",
+          prompt: "Interactive item",
+          agentKind: "codex",
+          model: null,
+          executionMode: "read_only",
+          parentTask: null,
+          dependencies: [],
+          interactive: true,
+        },
+        {
+          clientKey: "normal-item",
+          title: "Normal item",
+          prompt: "Normal item",
+          agentKind: "claude_code",
+          model: null,
+          executionMode: "read_only",
+          parentTask: null,
+          dependencies: [],
+          interactive: false,
+        },
+      ],
+    });
+    const interactiveItem = batch.taskMapping.find((entry) => entry.clientKey === "interactive-item")?.task;
+    const normalItem = batch.taskMapping.find((entry) => entry.clientKey === "normal-item")?.task;
+    expect(interactiveItem).toBeTruthy();
+    expect(normalItem).toBeTruthy();
+    // 全局 2 槽已满(1 共享 + 1 预留被 interactive single 占用):批内两项此刻
+    // 都排队;普通项带 global_budget,interactive 项同样 global_budget(全局
+    // 满对 interactive 也拒——预留只豁免「共享槽收缩」,不突破全局上限)。
+    await waitStatus(world, repo.run.id, normalItem!.id, "queued");
+    expect(queueReasonOf(world, repo.run.id, normalItem!.id)).toBe("global_budget");
+    await waitStatus(world, repo.run.id, interactiveItem!.id, "queued");
+    expect(queueReasonOf(world, repo.run.id, interactiveItem!.id)).toBe("global_budget");
+    // 释放 interactive single(预留槽空出)→ interactive 项经 drain 领预留槽,
+    // 而先于它排队的普通任务(second/normal item)仍被拒:标记确实贯穿到了
+    // launch 的 budgetTask(否则该项会以普通身份继续排队)。
+    world.children.complete(interactiveSingle.id);
+    await waitStatus(world, repo.run.id, interactiveSingle.id, "awaiting_report");
+    await waitStatus(world, repo.run.id, interactiveItem!.id, "running");
+    expect(queueReasonOf(world, repo.run.id, interactiveItem!.id)).toBeNull();
+    expect((await taskOf(world, repo.run.id, normalItem!.id)).status).toBe("queued");
+    expect((await taskOf(world, repo.run.id, second)).status).toBe("queued");
+  }, 30000);
 });
 
 // ---- 6. 工作台六分区(US2 / T012,quickstart 场景 1 步骤 2 等价)----
@@ -887,4 +983,206 @@ describe("工作台六分区", () => {
       }
     }
   }, 60000);
+});
+
+// ---- 7. 资源感知调度(T026 / 契约 C 节不变量 4 资源版,quickstart 场景 4)----
+
+describe("ResourceMonitor 资源感知", () => {
+  /** 可变 stub 探针状态:改字段 = 改下一轮采样读到的机器状态。 */
+  interface StubMachine {
+    loadavg1: number;
+    cpuCores: number;
+    disk: { freeBytes: number; totalBytes: number } | null;
+  }
+
+  /**
+   * 组装 ResourceMonitor + 可变探针 stub。默认注入记录型预算(观测推送值),
+   * 传 budget 时用真实 ConcurrencyBudget(集成用例)。intervalMs=10ms 让
+   * waitFor 在真实定时器路径上驱动多轮采样。
+   */
+  function stubMonitor(input: {
+    machine: StubMachine;
+    settings?: { resourcePauseEnabled?: boolean; minFreeDiskBytes?: number };
+    budget?: ConcurrencyBudget;
+  }): { monitor: ResourceMonitor; pushed: Array<boolean | null> } {
+    const pushed: Array<boolean | null> = [];
+    const budget =
+      input.budget ?? {
+        setResourcePressure: (value: boolean | null): void => {
+          pushed.push(value);
+        },
+      };
+    const monitor = new ResourceMonitor({
+      probes: {
+        sampleSystem: () => ({
+          loadavg: [input.machine.loadavg1, 0, 0],
+          freeMemBytes: 0,
+          totalMemBytes: 0,
+          cpuCores: input.machine.cpuCores,
+        }),
+        sampleDisk: async () => input.machine.disk,
+      },
+      budget,
+      paths: { worktreeRoot: () => "/tmp/octopunk-resource-monitor-worktrees" },
+      settings: () => ({
+        resourcePauseEnabled: input.settings?.resourcePauseEnabled ?? true,
+        minFreeDiskBytes: input.settings?.minFreeDiskBytes ?? DEFAULT_MIN_FREE_DISK_BYTES,
+      }),
+      intervalMs: 10,
+    });
+    return { monitor, pushed };
+  }
+
+  it("负载超 cpuCores×2 → setResourcePressure(true);恢复 → false,latest() 快照随轮更新", async () => {
+    const machine: StubMachine = {
+      loadavg1: 1,
+      cpuCores: 4,
+      disk: { freeBytes: DEFAULT_MIN_FREE_DISK_BYTES * 4, totalBytes: DEFAULT_MIN_FREE_DISK_BYTES * 8 },
+    };
+    const { monitor, pushed } = stubMonitor({ machine });
+    monitor.start();
+    try {
+      await waitFor("首轮低压推送 false", () => pushed.length >= 1 && pushed[pushed.length - 1] === false);
+      machine.loadavg1 = 4 * 2 + 0.5; // > cores × 2
+      await waitFor("负载高压推送 true", () => pushed[pushed.length - 1] === true);
+      const high = monitor.latest();
+      expect(high.sampledAt).not.toBeNull();
+      expect(high.loadavg1).toBe(machine.loadavg1);
+      expect(high.cpuCores).toBe(4);
+      expect(high.loadHigh).toBe(true);
+      expect(high.diskLow).toBe(false);
+      expect(high.pressure).toBe(true);
+      expect(high.pausingNewTasks).toBe(true);
+      machine.loadavg1 = 0.5;
+      await waitFor("恢复推送 false", () => pushed[pushed.length - 1] === false);
+      const recovered = monitor.latest();
+      expect(recovered.pressure).toBe(false);
+      expect(recovered.pausingNewTasks).toBe(false);
+    } finally {
+      monitor.stop();
+    }
+  }, 30000);
+
+  it("磁盘余量低于阈值 → true;statfs 失败(null)时磁盘维度不参与,负载仍判 → false", async () => {
+    const machine: StubMachine = {
+      loadavg1: 1,
+      cpuCores: 4,
+      disk: { freeBytes: DEFAULT_MIN_FREE_DISK_BYTES - 1, totalBytes: DEFAULT_MIN_FREE_DISK_BYTES * 8 },
+    };
+    const { monitor, pushed } = stubMonitor({ machine });
+    monitor.start();
+    try {
+      await waitFor("磁盘高压推送 true", () => pushed.length >= 1 && pushed[pushed.length - 1] === true);
+      const high = monitor.latest();
+      expect(high.diskLow).toBe(true);
+      expect(high.diskFreeBytes).toBe(machine.disk?.freeBytes);
+      expect(high.pressure).toBe(true);
+      // 探测失败 → 磁盘维度退出判定;loadavg 恒可得,整体回到 false(非 null)。
+      machine.disk = null;
+      await waitFor("磁盘维度退出后回到 false", () => pushed.length >= 2 && pushed[pushed.length - 1] === false);
+      const degraded = monitor.latest();
+      expect(degraded.diskFreeBytes).toBeNull();
+      expect(degraded.diskLow).toBeNull();
+      expect(degraded.loadHigh).toBe(false);
+      expect(degraded.pressure).toBe(false);
+    } finally {
+      monitor.stop();
+    }
+  }, 30000);
+
+  it("resourcePauseEnabled=false:两维都高压也恒传 false(只展示不拦截)", async () => {
+    const machine: StubMachine = { loadavg1: 100, cpuCores: 1, disk: { freeBytes: 0, totalBytes: 1 } };
+    const { monitor, pushed } = stubMonitor({
+      machine,
+      settings: { resourcePauseEnabled: false },
+    });
+    monitor.start();
+    try {
+      await waitFor("首轮推送", () => pushed.length >= 1);
+      expect(pushed.every((value) => value === false)).toBe(true);
+      const latest = monitor.latest();
+      expect(latest.pressure).toBe(true); // 原始判定仍如实入快照
+      expect(latest.pausingNewTasks).toBe(false); // 但不进预算闸门
+    } finally {
+      monitor.stop();
+    }
+  }, 30000);
+
+  it("预算集成(不变量 4 资源版):高压拒新配额 resource_pressure,已持有不受影响;恢复 → onCapacityFreed 重排后放行", async () => {
+    const machine: StubMachine = {
+      loadavg1: 1,
+      cpuCores: 4,
+      disk: { freeBytes: DEFAULT_MIN_FREE_DISK_BYTES * 4, totalBytes: DEFAULT_MIN_FREE_DISK_BYTES * 8 },
+    };
+    const freed: Array<string | null> = [];
+    const budget = new ConcurrencyBudget({
+      settings: (): ConcurrencyBudgetSettings => ({
+        globalMaxChildren: 6,
+        perProjectMaxChildren: 10,
+        perKindMaxChildren: 10,
+        resourcePauseEnabled: true,
+        interactiveSlotReserved: false,
+      }),
+      onCapacityFreed: (runID) => freed.push(runID),
+    });
+    const heldTask = {
+      taskID: "held-running",
+      runID: "run-pressure",
+      repositoryPath: "/repo/pressure",
+      agentKind: "claude_code" as const,
+      runMaxConcurrentTasks: 5,
+    };
+    expect(budget.tryAcquire(heldTask)).toEqual({ granted: true, reason: null });
+
+    const { monitor } = stubMonitor({ machine, budget });
+    monitor.start();
+    try {
+      await waitFor("首轮低压", () => budget.activeCounts().resourcePressure === false);
+      machine.loadavg1 = 4 * 2 + 0.5; // > cores × 2 → 高压
+      await waitFor("高压生效", () => budget.activeCounts().resourcePressure === true);
+      // 新任务被拒 resource_pressure;运行中已持有的重入不受影响(红线)。
+      expect(budget.tryAcquire({ ...heldTask, taskID: "queued-new" })).toEqual({
+        granted: false,
+        reason: "resource_pressure",
+      });
+      expect(budget.tryAcquire(heldTask)).toEqual({ granted: true, reason: null });
+      expect(budget.activeCounts().global.active).toBe(1);
+
+      // 恢复(压力 true → false)→ onCapacityFreed(null) 全局重排链触发。
+      const freedBefore = freed.length;
+      machine.loadavg1 = 0.5;
+      await waitFor("压力清除", () => budget.activeCounts().resourcePressure === false);
+      await waitFor("capacity-freed 触发", () => freed.length > freedBefore);
+      expect(freed[freed.length - 1]).toBeNull();
+      expect(budget.tryAcquire({ ...heldTask, taskID: "queued-new" })).toEqual({
+        granted: true,
+        reason: null,
+      });
+    } finally {
+      monitor.stop();
+    }
+  }, 30000);
+
+  it("start/stop:启动即完成首轮采样;stop 后不再推进快照", async () => {
+    const machine: StubMachine = {
+      loadavg1: 1,
+      cpuCores: 4,
+      disk: { freeBytes: DEFAULT_MIN_FREE_DISK_BYTES * 4, totalBytes: DEFAULT_MIN_FREE_DISK_BYTES * 8 },
+    };
+    const { monitor, pushed } = stubMonitor({ machine });
+    expect(monitor.latest().sampledAt).toBeNull();
+    monitor.start();
+    try {
+      // start() 立即触发一轮(不等待第一个间隔)。
+      await waitFor("立即首轮采样", () => monitor.latest().sampledAt != null);
+      expect(pushed.length).toBeGreaterThanOrEqual(1);
+    } finally {
+      monitor.stop();
+    }
+    const sampledAt = monitor.latest().sampledAt;
+    machine.loadavg1 = 100;
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(monitor.latest().sampledAt).toBe(sampledAt); // 定时器已停
+    expect(monitor.latest().pressure).toBe(false); // 快照保持 stop 前的值
+  }, 30000);
 });

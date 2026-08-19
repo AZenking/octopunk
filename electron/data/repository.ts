@@ -1858,6 +1858,23 @@ export class SqliteTeamRunRepository implements TeamRunRepository {
     }, [input.runID]);
   }
 
+  async attemptPid(input: { runID: string; taskID: string }): Promise<number | null> {
+    // Read side of the v11 task_attempts.pid column: the task's CURRENT
+    // attempt only (historical attempts are irrelevant for reconciliation).
+    const row = oneRow(
+      this.db,
+      `SELECT attempts.pid AS pid
+       FROM child_tasks task
+       JOIN task_attempts attempts ON attempts.id = task.current_attempt_id
+       WHERE task.run_id = ? AND task.id = ?`,
+      input.runID,
+      input.taskID,
+    );
+    if (row == null) return null;
+    const pid = row.pid;
+    return typeof pid === "number" && Number.isInteger(pid) ? pid : null;
+  }
+
   async importLegacySnapshot(data: Buffer, sourceURL: string): Promise<TeamRunSnapshot | null> {
     return this.write((db) => {
       const imported = oneRow(

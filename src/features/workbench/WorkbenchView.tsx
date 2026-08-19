@@ -3,7 +3,7 @@
 // 跳转运行详情(复用 TeamDashboardView 的 appState 选中机制)。
 // 仅用 shadcn/ui 原语与 Tailwind 工具类;渲染进程只经 window.octopunk.invoke。
 
-import { Gauge, Inbox, LoaderCircle, MoreHorizontal, Pause, Play, RefreshCw } from "lucide-react";
+import { Activity, Gauge, Inbox, LoaderCircle, MoreHorizontal, Pause, Play, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { QueueReasonDTO, WorkbenchEntryDTO, WorkbenchSectionDTO } from "../../../shared/dtos";
 import { displayNameForAgentKind } from "../../../shared/dtos";
@@ -25,6 +25,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { taskStatusToAgent } from "@/lib/agentView";
 import { cn } from "@/lib/utils";
+import { RecoveryPanel } from "./RecoveryPanel";
 
 /** 轮询间隔:工作台聚合视图按 5s 自动刷新(手动刷新随时可用)。 */
 const REFRESH_INTERVAL_MS = 5_000;
@@ -51,6 +52,84 @@ const QUEUE_REASON_LABEL: Record<QueueReasonDTO, string> = {
 
 /** run 优先级取值范围 -5..5;越大越先获得配额。 */
 const PRIORITY_CHOICES = [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5];
+
+/**
+ * scheduler:resource-status 载荷(T027):主进程 ResourceMonitor 最近一轮
+ * 采样快照的结构镜像(负载/磁盘/高压判定),字段语义见
+ * electron/application/resourceMonitor.ts 的 ResourcePressureSnapshot。
+ */
+interface ResourceStatusPayload {
+  sampledAt: number | null;
+  loadavg1: number | null;
+  cpuCores: number | null;
+  loadHigh: boolean | null;
+  diskFreeBytes: number | null;
+  diskTotalBytes: number | null;
+  diskLow: boolean | null;
+  /** null = 两维探测都不可得(尽力而为,不拦截)。 */
+  pressure: boolean | null;
+  /** 实际拦截位:原始高压 ∧ 设置页「资源高压暂停」总闸。 */
+  pausingNewTasks: boolean;
+}
+
+/** 字节数展示:≥1GiB 用 GiB 一位小数,否则 MiB 整数。 */
+function formatBytes(bytes: number): string {
+  const gib = bytes / 1024 ** 3;
+  if (gib >= 1) return `${gib.toFixed(1)} GiB`;
+  return `${Math.max(0, Math.round(bytes / 1024 ** 2))} MiB`;
+}
+
+/** 资源状态徽标文案 + 配色(与 RecoveryPanel 的状态徽标同一风格)。 */
+function resourceBadge(status: ResourceStatusPayload): {
+  label: string;
+  className: string;
+} {
+  if (status.pausingNewTasks) {
+    return {
+      label: "资源高压 · 新任务暂缓",
+      className: "border-red-500/40 bg-red-500/10 text-status-error",
+    };
+  }
+  if (status.pressure === true) {
+    return {
+      label: "资源高压(暂停已关闭)",
+      className: "border-amber-500/40 bg-amber-500/10 text-status-idle",
+    };
+  }
+  if (status.pressure == null) {
+    return { label: "资源状态未知", className: "border-amber-500/40 bg-amber-500/10 text-status-idle" };
+  }
+  return { label: "资源正常", className: "border-emerald-500/30 bg-emerald-500/10 text-status-running" };
+}
+
+/** 资源状态一行徽标(T027):最新采样负载/磁盘余量/高压与否;null = 待采样隐藏。 */
+function ResourceStatusBar({ status }: { status: ResourceStatusPayload | null }) {
+  if (status == null || status.sampledAt == null) return null;
+  const badge = resourceBadge(status);
+  const load =
+    status.loadavg1 != null
+      ? `负载 ${status.loadavg1.toFixed(2)}${status.cpuCores != null ? ` / ${status.cpuCores} 核` : ""}`
+      : "负载不可得";
+  const disk =
+    status.diskFreeBytes != null ? `磁盘余量 ${formatBytes(status.diskFreeBytes)}` : "磁盘余量不可得";
+  return (
+    <div className="border-border bg-muted/30 flex h-7 shrink-0 items-center gap-2 border-b px-4">
+      <Activity className="text-muted-foreground size-3.5 shrink-0" aria-hidden />
+      <Badge variant="secondary" className={cn("px-1.5 py-0 text-[10px]", badge.className)}>
+        {badge.label}
+      </Badge>
+      <span className="text-muted-foreground truncate font-mono text-[10px]" title={`${load} · ${disk}`}>
+        {load} · {disk}
+      </span>
+      <span
+        className="text-muted-foreground ml-auto shrink-0 font-mono text-[10px]"
+        title={`采样于 ${formatEpoch(status.sampledAt / 1000)}`}
+      >
+        {new Date(status.sampledAt).toLocaleTimeString()}
+      </span>
+    </div>
+  );
+}
 
 function formatEpoch(epochSeconds: number): string {
   return new Date(epochSeconds * 1000).toLocaleString();
@@ -166,6 +245,7 @@ function WorkbenchEntryCard({
 
 export function WorkbenchView({ onSelectRun }: { onSelectRun: (runID: string) => void }) {
   const [sections, setSections] = useState<WorkbenchSectionDTO[] | null>(null);
+  const [resourceStatus, setResourceStatus] = useState<ResourceStatusPayload | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
@@ -194,12 +274,27 @@ export function WorkbenchView({ onSelectRun }: { onSelectRun: (runID: string) =>
     }
   }, []);
 
+  // 资源状态(T027)尽力而为:拉取失败保留上一轮,不打断工作台聚合。
+  const loadResourceStatus = useCallback(async (): Promise<void> => {
+    try {
+      const status = await window.octopunk.invoke<ResourceStatusPayload>("scheduler:resource-status");
+      if (!mountedRef.current) return;
+      setResourceStatus(status);
+    } catch {
+      // 保留上一轮快照;主进程监控仍在按 5s 采样。
+    }
+  }, []);
+
   // 首载 + 5s 自动轮询;手动刷新共用同一路径。
   useEffect(() => {
     void loadSummary();
-    const timer = window.setInterval(() => void loadSummary(), REFRESH_INTERVAL_MS);
+    void loadResourceStatus();
+    const timer = window.setInterval(() => {
+      void loadSummary();
+      void loadResourceStatus();
+    }, REFRESH_INTERVAL_MS);
     return () => window.clearInterval(timer);
-  }, [loadSummary]);
+  }, [loadSummary, loadResourceStatus]);
 
   const runAction = async (channel: "run:pause" | "run:resume", runID: string): Promise<void> => {
     setActionBusy(`${channel}:${runID}`);
@@ -250,12 +345,17 @@ export function WorkbenchView({ onSelectRun }: { onSelectRun: (runID: string) =>
           aria-label="刷新工作台"
           title="刷新工作台"
           disabled={loading}
-          onClick={() => void loadSummary()}
+          onClick={() => {
+            void loadSummary();
+            void loadResourceStatus();
+          }}
           className="app-no-drag cursor-pointer"
         >
           {loading ? <LoaderCircle className="animate-spin" aria-hidden /> : <RefreshCw aria-hidden />}
         </Button>
       </header>
+
+      <ResourceStatusBar status={resourceStatus} />
 
       {error != null && (
         <div className="border-border bg-destructive/5 flex shrink-0 items-center justify-between gap-3 border-b px-4 py-2">
@@ -272,6 +372,8 @@ export function WorkbenchView({ onSelectRun }: { onSelectRun: (runID: string) =>
       )}
 
       <div className="min-h-0 flex-1 overflow-y-auto p-4">
+        {/* 崩溃恢复分区(T020):可折叠,置顶于六分区网格之前;点击条目缩略 ID 同样跳运行详情。 */}
+        <RecoveryPanel onSelectRun={onSelectRun} />
         {sections == null && loading ? (
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 2xl:grid-cols-3">
             {SECTION_META.map((meta) => (
