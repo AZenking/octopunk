@@ -499,6 +499,99 @@ export interface DeliverySummaryDTO {
 export const AGENT_KINDS: ChildAgentKind[] = ["claude_code", "codex"];
 export const EXECUTION_MODES: TaskExecutionMode[] = ["read_only", "workspace_write"];
 
+// ---- v0.3 稳定性与多任务运行(specs/001-v03-stability-multi-teamrun)----
+
+/** 任务排队原因 = 闸门拒绝级别(queued 任务的派生字段;null = 未在排队)。 */
+export type QueueReasonDTO =
+  | "global_budget"
+  | "project_budget"
+  | "kind_budget"
+  | "resource_pressure"
+  | "launch_stagger"
+  | "run_paused";
+
+/** 工作台条目 = 六分区聚合视图的最小任务投影(数据源:observeRunSummaries + runSummary)。 */
+export interface WorkbenchEntryDTO {
+  runID: string;
+  /** 所属运行的顶层任务描述(TeamRun.task)。 */
+  runTitle: string;
+  repositoryPath: string;
+  taskID: string;
+  title: string;
+  agentKind: string;
+  status: string;
+  /** 仅 queued 分区有值,标注闸门拒绝级别;其余分区为 null。 */
+  queueReason: QueueReasonDTO | null;
+  updatedAt: EpochSeconds;
+}
+
+/** 工作台单个分区(派生视图,不落库;entries 已按分区语义过滤)。 */
+export interface WorkbenchSectionDTO {
+  section: "running" | "queued" | "awaiting_input" | "failed" | "awaiting_review" | "integratable";
+  entries: WorkbenchEntryDTO[];
+}
+
+/** run 级调度控制字段(team_runs.priority / paused_at;不并入既有摘要 DTO,独立返回)。 */
+export interface RunControlDTO {
+  /** 调度排序权重:priority DESC, created_at ASC;越大越先得配额(MCP 允许 -5..5)。 */
+  priority: number;
+  /** 暂停时间戳;null = 未暂停。暂停只停新配额发放,不影响运行中任务。 */
+  pausedAt: EpochSeconds | null;
+}
+
+/** 体检检查项种类(与 doctor_check_items.check_key 对齐,共九项)。 */
+export type DoctorCheckKeyDTO =
+  | "cli_path"
+  | "gui_path"
+  | "login"
+  | "mcp_stdio"
+  | "git_repo"
+  | "worktree_disk"
+  | "sandbox"
+  | "provider_quota"
+  | "db_health";
+
+/** 体检逐项明细(doctor_check_items;unknown 表示无法确认或单项超时)。 */
+export interface DoctorCheckItemDTO {
+  checkKey: DoctorCheckKeyDTO;
+  status: "pass" | "fail" | "unknown";
+  /** 结论摘要(redact ≤2KiB;fail 时含观测值)。 */
+  detail: string;
+  /** 影响范围(如「委派将失败」)。 */
+  impact: string;
+  /** 推荐处理方式。 */
+  suggestion: string;
+  /** 单项耗时(毫秒)。 */
+  durationMs: number;
+}
+
+/** 体检报告(doctor_reports;overall 有 fail 即 fail,仅 unknown 即 degraded,全 pass 即 pass)。 */
+export interface DoctorReportDTO {
+  id: string;
+  /** 触发来源:user(手动)/ codex(MCP)/ prestart(启动拦截)。 */
+  triggeredBy: string;
+  /** 体检针对的仓库;null = 全局项。 */
+  repositoryPath: string | null;
+  overall: "pass" | "fail" | "degraded";
+  items: DoctorCheckItemDTO[];
+  createdAt: EpochSeconds;
+}
+
+/** 恢复视图单项(启动时与手动刷新时派生,不落库)。 */
+export interface RecoveryItemDTO {
+  kind: "interrupted" | "process_alive" | "orphan_worktree" | "orphan_branch" | "stale_lock";
+  runID: string | null;
+  taskID: string | null;
+  detail: string;
+  suggestion: string;
+}
+
+/** 恢复视图 = 非终态 run × 进程核对结果 × 孤儿扫描结果。 */
+export interface RecoveryStatusDTO {
+  items: RecoveryItemDTO[];
+  scannedAt: EpochSeconds;
+}
+
 export function displayNameForAgentKind(kind: string): string {
   return kind === "codex" ? "Codex" : kind === "claude_code" ? "Claude Code" : kind;
 }

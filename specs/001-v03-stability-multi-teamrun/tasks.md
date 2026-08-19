@@ -21,7 +21,7 @@ description: "Task list for v0.3 稳定性与多任务运行"
 
 ## Phase 1: Setup (Shared Infrastructure)
 
-- [ ] T001 在 `shared/dtos.ts` 增加 v0.3 共享 DTO(WorkbenchSectionDTO/WorkbenchEntryDTO/QueueReasonDTO、DoctorReportDTO/DoctorCheckItemDTO(check_key 九值联合)、RecoveryItemDTO/RecoveryStatusDTO、RunControlDTO(priority/pausedAt),字段对齐 specs/001 各文档),并创建 `src/features/workbench/` 与 `src/features/doctor/` 目录骨架
+- [x] T001 在 `shared/dtos.ts` 增加 v0.3 共享 DTO(WorkbenchSectionDTO/WorkbenchEntryDTO/QueueReasonDTO、DoctorReportDTO/DoctorCheckItemDTO(check_key 九值联合)、RecoveryItemDTO/RecoveryStatusDTO、RunControlDTO(priority/pausedAt),字段对齐 specs/001 各文档),并创建 `src/features/workbench/` 与 `src/features/doctor/` 目录骨架
 
 ---
 
@@ -29,11 +29,11 @@ description: "Task list for v0.3 稳定性与多任务运行"
 
 **⚠️ 全部用户故事依赖本阶段**
 
-- [ ] T002 SQLite 迁移 v10 → v11:`electron/data/database.ts` —— `team_runs` 加 `priority INTEGER NOT NULL DEFAULT 0`、`paused_at REAL`;`task_attempts` 加 `pid INTEGER`;新表 `doctor_reports`/`doctor_check_items`(结构见 data-model.md,DDL 风格照既有 stage)
-- [ ] T003 [P] 领域层:`electron/domain/models.ts` 加 RUN_PRIORITIES(-5..5)与排序规则、DOCTOR_CHECK_KEYS(九值)/DOCTOR_STATUSES(pass/fail/unknown)/DOCTOR_OVERALLS、RecoveryAction 纯模型;`electron/domain/repositoryPort.ts` 扩展端口:setRunPriority/pauseRun/resumeRun、recordDoctorReport/getLatestDoctorReport/rerunDoctorCheckItem、updateAttemptPid
-- [ ] T004 [P] 设置与钳制:`electron/settingsStore.ts` 加六个键(data-model 表);`shared/ipc.ts` 加对应 clamp 函数(照 clampTaskRetryLimit 模式)与 SchedulerSettingsPayload
-- [ ] T005 仓储实现:`electron/data/repository.ts` + `electron/data/mappers.ts` —— 优先级/暂停更新(乐观锁+审计事件 run.paused/resumed/priorityChanged)、doctor 两表读写、attempt pid 更新、runSummaries 附 priority/pausedAt;`electron/domain/events.ts` 扩 kind(deps: T002, T003)
-- [ ] T006 仓储测试:扩展 `tests/repository.test.ts` —— v11 迁移、优先级/暂停留痕、doctor 报告与单项重检、pid 写清(deps: T005)
+- [x] T002 SQLite 迁移 v10 → v11:`electron/data/database.ts` —— `team_runs` 加 `priority INTEGER NOT NULL DEFAULT 0`、`paused_at REAL`;`task_attempts` 加 `pid INTEGER`;新表 `doctor_reports`/`doctor_check_items`(结构见 data-model.md,DDL 风格照既有 stage)
+- [x] T003 [P] 领域层:`electron/domain/models.ts` 加 RUN_PRIORITIES(-5..5)与排序规则、DOCTOR_CHECK_KEYS(九值)/DOCTOR_STATUSES(pass/fail/unknown)/DOCTOR_OVERALLS、RecoveryAction 纯模型;`electron/domain/repositoryPort.ts` 扩展端口:setRunPriority/pauseRun/resumeRun、recordDoctorReport/getLatestDoctorReport/rerunDoctorCheckItem、updateAttemptPid
+- [x] T004 [P] 设置与钳制:`electron/settingsStore.ts` 加六个键(data-model 表);`shared/ipc.ts` 加对应 clamp 函数(照 clampTaskRetryLimit 模式)与 SchedulerSettingsPayload
+- [x] T005 仓储实现:`electron/data/repository.ts` + `electron/data/mappers.ts` —— 优先级/暂停更新(乐观锁+审计事件 run.paused/resumed/priorityChanged)、doctor 两表读写、attempt pid 更新、runSummaries 附 priority/pausedAt;`electron/domain/events.ts` 扩 kind(deps: T002, T003)
+- [x] T006 仓储测试:扩展 `tests/repository.test.ts` —— v11 迁移、优先级/暂停留痕、doctor 报告与单项重检、pid 写清(deps: T005)
 
 **Checkpoint**: 数据层就绪,四个故事可并行。
 

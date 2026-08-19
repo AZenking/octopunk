@@ -87,6 +87,60 @@ export function clampLaunchStaggerSeconds(value: unknown): number {
   return Math.min(LAUNCH_STAGGER_SECONDS_MAX, Math.max(0, Math.round(parsed)));
 }
 
+// ---- Scheduler concurrency & resource settings (specs/001-v03 T004) ----
+
+/** Global cap on concurrent child-agent processes across all runs (default 6, range 1–20). */
+export const DEFAULT_GLOBAL_MAX_CHILDREN = 6;
+export const GLOBAL_MAX_CHILDREN_MAX = 20;
+
+/** Per-repository cap on concurrent child-agent processes (default 3, range 1–10). */
+export const DEFAULT_PER_PROJECT_MAX_CHILDREN = 3;
+export const PER_PROJECT_MAX_CHILDREN_MAX = 10;
+
+/** Per-agent-kind cap on concurrent child-agent processes (default 3, range 1–10). */
+export const DEFAULT_PER_KIND_MAX_CHILDREN = 3;
+export const PER_KIND_MAX_CHILDREN_MAX = 10;
+
+/** Minimum free disk bytes before resource pressure pauses new launches (default 1 GiB). */
+export const DEFAULT_MIN_FREE_DISK_BYTES = 1073741824;
+/** Lower bound for a configurable disk threshold: 100 MiB. */
+export const MIN_FREE_DISK_BYTES_FLOOR = 104857600;
+
+/** scheduler:settings 读写载荷(设置页三级并发与资源阈值,specs/001-v03 B 节)。 */
+export interface SchedulerSettingsPayload {
+  globalMaxChildren: number;
+  perProjectMaxChildren: number;
+  perKindMaxChildren: number;
+  resourcePauseEnabled: boolean;
+  minFreeDiskBytes: number;
+  interactiveSlotReserved: boolean;
+}
+
+export function clampGlobalMaxChildren(value: unknown): number {
+  const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_GLOBAL_MAX_CHILDREN;
+  return Math.min(GLOBAL_MAX_CHILDREN_MAX, Math.max(1, Math.round(parsed)));
+}
+
+export function clampPerProjectMaxChildren(value: unknown): number {
+  const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_PER_PROJECT_MAX_CHILDREN;
+  return Math.min(PER_PROJECT_MAX_CHILDREN_MAX, Math.max(1, Math.round(parsed)));
+}
+
+export function clampPerKindMaxChildren(value: unknown): number {
+  const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_PER_KIND_MAX_CHILDREN;
+  return Math.min(PER_KIND_MAX_CHILDREN_MAX, Math.max(1, Math.round(parsed)));
+}
+
+/** Disk threshold has no upper bound (only the 100 MiB floor keeps it meaningful). */
+export function clampMinFreeDiskBytes(value: unknown): number {
+  const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_MIN_FREE_DISK_BYTES;
+  return Math.max(MIN_FREE_DISK_BYTES_FLOOR, Math.round(parsed));
+}
+
 export interface ChildModelsPayload {
   claudeModel: string;
   codexModel: string;

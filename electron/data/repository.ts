@@ -16,6 +16,9 @@ import type {
   ContextFetchDigest,
   ContextTaskDigest,
   DeliverySummary,
+  DoctorCheckKey,
+  DoctorCheckStatus,
+  DoctorTriggeredBy,
   RelayEvent,
   ReviewComment,
   ReviewFinding,
@@ -31,6 +34,8 @@ import type {
 } from "../domain/models";
 import {
   canTransitionReviewComment,
+  doctorOverallOf,
+  isValidRunPriority,
   makeArbitration,
   makeDeliverySummary,
   makeReviewComment,
@@ -51,6 +56,8 @@ import {
   type DelegateTaskInput,
   type DelegateTasksInput,
   type DelegateTasksResult,
+  type DoctorReport,
+  type DoctorReportItem,
   type GateEvaluation,
   type GateEvaluationItem,
   type PrLink,
@@ -1589,6 +1596,268 @@ export class SqliteTeamRunRepository implements TeamRunRepository {
     }, [runID]);
   }
 
+  // ---- v0.3 stability & multi-run (specs/001-v03-stability-multi-teamrun) ----
+
+  async setRunPriority(input: { requestID: string; runID: string; priority: number }): Promise<TeamRun> {
+    return this.write((db) => {
+      const cached = cachedResponse<TeamRun>(db, input.requestID);
+      if (cached) return cached;
+      if (!isValidRunPriority(input.priority)) {
+        throw DomainError.invalidTask(
+          `Run priority must be an integer between -5 and 5 (got ${input.priority}).`,
+        );
+      }
+      const run = requireRunSync(db, input.runID);
+      if (run.priority === input.priority) {
+        // No-op change: return the current run without spamming duplicate events.
+        saveResponse(db, input.requestID, run);
+        return run;
+      }
+      const info = db
+        .prepare(
+          `UPDATE team_runs
+           SET priority = ?, revision = revision + 1, updated_at = ?
+           WHERE id = ? AND revision = ?`,
+        )
+        .run(input.priority, nowSeconds(), run.id, run.revision);
+      if (info.changes !== 1) throw DomainError.optimisticLockFailed();
+      appendEvent(db, {
+        runID: input.runID,
+        taskID: null,
+        kind: TeamEventKind.runPriorityChanged,
+        payload: encodeTeamEventPayload(
+          makeTeamEventPayload(`TeamRun priority ${run.priority} → ${input.priority}`, input.requestID, {
+            from: String(run.priority),
+            to: String(input.priority),
+          }),
+        ),
+      });
+      const updated = requireRunSync(db, input.runID);
+      saveResponse(db, input.requestID, updated);
+      return updated;
+    }, [input.runID]);
+  }
+
+  async pauseRun(input: { requestID: string; runID: string }): Promise<TeamRun> {
+    return this.write((db) => {
+      const cached = cachedResponse<TeamRun>(db, input.requestID);
+      if (cached) return cached;
+      const run = requireRunSync(db, input.runID);
+      if (run.pausedAt != null) {
+        // Idempotent: pausing an already-paused run returns the current state.
+        saveResponse(db, input.requestID, run);
+        return run;
+      }
+      const now = nowSeconds();
+      const info = db
+        .prepare(
+          `UPDATE team_runs
+           SET paused_at = ?, revision = revision + 1, updated_at = ?
+           WHERE id = ? AND revision = ?`,
+        )
+        .run(now, now, run.id, run.revision);
+      if (info.changes !== 1) throw DomainError.optimisticLockFailed();
+      appendEvent(db, {
+        runID: input.runID,
+        taskID: null,
+        kind: TeamEventKind.runPaused,
+        payload: encodeTeamEventPayload(
+          makeTeamEventPayload(
+            "TeamRun paused: new quota grants stop, in-flight tasks continue",
+            input.requestID,
+          ),
+        ),
+      });
+      const updated = requireRunSync(db, input.runID);
+      saveResponse(db, input.requestID, updated);
+      return updated;
+    }, [input.runID]);
+  }
+
+  async resumeRun(input: { requestID: string; runID: string }): Promise<TeamRun> {
+    return this.write((db) => {
+      const cached = cachedResponse<TeamRun>(db, input.requestID);
+      if (cached) return cached;
+      const run = requireRunSync(db, input.runID);
+      if (run.pausedAt == null) {
+        // Idempotent: resuming a running run returns the current state.
+        saveResponse(db, input.requestID, run);
+        return run;
+      }
+      const info = db
+        .prepare(
+          `UPDATE team_runs
+           SET paused_at = NULL, revision = revision + 1, updated_at = ?
+           WHERE id = ? AND revision = ?`,
+        )
+        .run(nowSeconds(), run.id, run.revision);
+      if (info.changes !== 1) throw DomainError.optimisticLockFailed();
+      appendEvent(db, {
+        runID: input.runID,
+        taskID: null,
+        kind: TeamEventKind.runResumed,
+        payload: encodeTeamEventPayload(
+          makeTeamEventPayload("TeamRun resumed: queued tasks continue by priority", input.requestID),
+        ),
+      });
+      const updated = requireRunSync(db, input.runID);
+      saveResponse(db, input.requestID, updated);
+      return updated;
+    }, [input.runID]);
+  }
+
+  async recordDoctorReport(input: {
+    requestID: string;
+    triggeredBy: DoctorTriggeredBy;
+    repositoryPath: string | null;
+    items: {
+      checkKey: DoctorCheckKey;
+      status: DoctorCheckStatus;
+      detail: string;
+      impact: string;
+      suggestion: string;
+      durationMs: number;
+    }[];
+  }): Promise<DoctorReport> {
+    // Doctor tables are run-independent: no run observers to notify.
+    return this.write((db) => {
+      const cached = cachedResponse<DoctorReport>(db, input.requestID);
+      if (cached) return cached;
+      // The overall is derived in the domain, never trusted from the caller.
+      const overall = doctorOverallOf(input.items);
+      const reportID = randomUUID();
+      const createdAt = nowSeconds();
+      db.prepare(
+        `INSERT INTO doctor_reports(id, triggered_by, repository_path, overall, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).run(reportID, input.triggeredBy, input.repositoryPath, overall, createdAt);
+      const insertItem = db.prepare(
+        `INSERT INTO doctor_check_items(
+            id, report_id, check_key, status, detail, impact, suggestion, duration_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      const items: DoctorReportItem[] = input.items.map((item) => {
+        const itemID = randomUUID();
+        insertItem.run(
+          itemID,
+          reportID,
+          item.checkKey,
+          item.status,
+          item.detail,
+          item.impact,
+          item.suggestion,
+          item.durationMs,
+        );
+        return {
+          id: itemID,
+          reportID,
+          checkKey: item.checkKey,
+          status: item.status,
+          detail: item.detail,
+          impact: item.impact,
+          suggestion: item.suggestion,
+          durationMs: item.durationMs,
+        };
+      });
+      const result: DoctorReport = {
+        id: reportID,
+        triggeredBy: input.triggeredBy,
+        repositoryPath: input.repositoryPath,
+        overall,
+        items,
+        createdAt,
+      };
+      saveResponse(db, input.requestID, result);
+      return result;
+    }, []);
+  }
+
+  async getLatestDoctorReport(repositoryPath: string | null): Promise<DoctorReport | null> {
+    // `IS ?` matches NULL repository paths for the global reports, exactly
+    // like the run-level delivery summary lookup.
+    const row = oneRow(
+      this.db,
+      "SELECT * FROM doctor_reports WHERE repository_path IS ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+      repositoryPath,
+    );
+    if (row == null) return null;
+    return DatabaseMappers.doctorReport(row, doctorItemsSync(this.db, row.id as string));
+  }
+
+  async rerunDoctorCheckItem(input: {
+    requestID: string;
+    reportID: string;
+    checkKey: DoctorCheckKey;
+    status: DoctorCheckStatus;
+    detail: string;
+    impact: string;
+    suggestion: string;
+    durationMs: number;
+  }): Promise<DoctorReport> {
+    return this.write((db) => {
+      const cached = cachedResponse<DoctorReport>(db, input.requestID);
+      if (cached) return cached;
+      const reportRow = oneRow(db, "SELECT id FROM doctor_reports WHERE id = ?", input.reportID);
+      if (reportRow == null) {
+        throw DomainError.invalidTask(`Doctor report not found: ${input.reportID}`);
+      }
+      const itemRow = oneRow(
+        db,
+        "SELECT id FROM doctor_check_items WHERE report_id = ? AND check_key = ?",
+        input.reportID,
+        input.checkKey,
+      );
+      if (itemRow == null) {
+        throw DomainError.invalidTask(`Doctor check item not found: ${input.checkKey}`);
+      }
+      db.prepare(
+        `UPDATE doctor_check_items
+         SET status = ?, detail = ?, impact = ?, suggestion = ?, duration_ms = ?
+         WHERE id = ?`,
+      ).run(
+        input.status,
+        input.detail,
+        input.impact,
+        input.suggestion,
+        input.durationMs,
+        itemRow.id,
+      );
+      // Recompute the overall from the persisted rows, never from input.
+      const overall = doctorOverallOf(doctorItemsSync(db, input.reportID));
+      db.prepare("UPDATE doctor_reports SET overall = ?, created_at = ? WHERE id = ?").run(
+        overall,
+        nowSeconds(),
+        input.reportID,
+      );
+      const updated = oneRow(db, "SELECT * FROM doctor_reports WHERE id = ?", input.reportID);
+      const result = DatabaseMappers.doctorReport(
+        updated as Row,
+        doctorItemsSync(db, input.reportID),
+      );
+      saveResponse(db, input.requestID, result);
+      return result;
+    }, []);
+  }
+
+  async updateAttemptPid(input: {
+    runID: string;
+    taskID: string;
+    attemptID: string;
+    pid: number | null;
+  }): Promise<void> {
+    this.write((db) => {
+      // Ownership: the attempt row only matches when it belongs to the task.
+      const info = db
+        .prepare("UPDATE task_attempts SET pid = ? WHERE id = ? AND task_id = ?")
+        .run(input.pid, input.attemptID, input.taskID);
+      if (info.changes !== 1) {
+        throw DomainError.invalidTask(
+          `Attempt ${input.attemptID} does not belong to task ${input.taskID}.`,
+        );
+      }
+    }, [input.runID]);
+  }
+
   async importLegacySnapshot(data: Buffer, sourceURL: string): Promise<TeamRunSnapshot | null> {
     return this.write((db) => {
       const imported = oneRow(
@@ -1781,6 +2050,7 @@ function runSummariesSync(db: SqliteDatabase): TeamRunSummary[] {
     repositoryPath: row.repository_path as string,
     task: row.task as string,
     status: DatabaseMappers.run(row).status,
+    priority: DatabaseMappers.run(row).priority,
     taskCount: row.task_count as number,
     acceptedTaskCount: (row.accepted_count as number | null) ?? 0,
     updatedAt: DatabaseMappers.run(row).updatedAt,
@@ -1812,6 +2082,14 @@ function gateItemsSync(db: SqliteDatabase, evaluationID: string): GateEvaluation
     "SELECT * FROM gate_evaluation_items WHERE evaluation_id = ? ORDER BY rowid",
     evaluationID,
   ).map(DatabaseMappers.gateEvaluationItem);
+}
+
+function doctorItemsSync(db: SqliteDatabase, reportID: string): DoctorReportItem[] {
+  return allRows(
+    db,
+    "SELECT * FROM doctor_check_items WHERE report_id = ? ORDER BY rowid",
+    reportID,
+  ).map(DatabaseMappers.doctorReportItem);
 }
 
 function loadTasksSync(db: SqliteDatabase, runID: string): ChildTask[] {

@@ -9,6 +9,8 @@ import type {
   ChildTask,
   ChildTaskStatus,
   DeliverySummary,
+  DoctorOverall,
+  DoctorTriggeredBy,
   RelayEvent,
   ReviewComment,
   ReviewCommentAuthor,
@@ -30,6 +32,8 @@ import type {
   TeamRunStatus,
 } from "../domain/models";
 import type {
+  DoctorReport,
+  DoctorReportItem,
   GateEvaluation,
   GateEvaluationItem,
   PrLink,
@@ -37,6 +41,9 @@ import type {
 import {
   CHILD_AGENT_KINDS,
   CHILD_TASK_STATUSES,
+  DOCTOR_CHECK_STATUSES,
+  DOCTOR_OVERALLS,
+  DOCTOR_TRIGGERED_BY,
   GATE_CHECK_STATUSES,
   GATE_OVERALLS,
   makeArbitration,
@@ -105,6 +112,9 @@ export const DatabaseMappers = {
       createdAt: date(row, "created_at"),
       updatedAt: date(row, "updated_at"),
       archivedAt: optionalDate(row, "archived_at"),
+      // v11 scheduling controls; makeTeamRun clamps legacy out-of-range rows.
+      priority: int(row, "priority"),
+      pausedAt: optionalDate(row, "paused_at"),
     });
   },
 
@@ -332,6 +342,35 @@ export const DatabaseMappers = {
     return {
       configJson: row.config_json as string,
       updatedAt: date(row, "updated_at"),
+    };
+  },
+
+  // ---- v0.3 stability & multi-run (specs/001-v03-stability-multi-teamrun) ----
+
+  doctorReportItem(row: Row): DoctorReportItem {
+    return {
+      id: uuid(row, "id"),
+      reportID: uuid(row, "report_id"),
+      checkKey: row.check_key as DoctorReportItem["checkKey"],
+      // Fail-safe parsing: an unrecognized status degrades to `unknown`
+      // (timeout-equivalent), never to a pass (specs/001 contract C6).
+      status: parseEnum<DoctorReportItem["status"]>(DOCTOR_CHECK_STATUSES, row.status, "unknown"),
+      detail: row.detail as string,
+      impact: row.impact as string,
+      suggestion: row.suggestion as string,
+      durationMs: int(row, "duration_ms"),
+    };
+  },
+
+  doctorReport(row: Row, items: DoctorReportItem[]): DoctorReport {
+    return {
+      id: uuid(row, "id"),
+      triggeredBy: parseEnum<DoctorTriggeredBy>(DOCTOR_TRIGGERED_BY, row.triggered_by, "user"),
+      repositoryPath: optionalString(row, "repository_path"),
+      // Fail-safe: an unrecognized overall reads as degraded, never as pass.
+      overall: parseEnum<DoctorOverall>(DOCTOR_OVERALLS, row.overall, "degraded"),
+      items,
+      createdAt: date(row, "created_at"),
     };
   },
 };

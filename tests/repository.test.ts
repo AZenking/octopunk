@@ -28,7 +28,7 @@ const startInput = (requestID: string, sessionID = "session-a") => ({
 describe("migrations", () => {
   it("applies all stages up to the current version", () => {
     const db = OctoPunkDatabase.inMemory();
-    expect(OctoPunkDatabaseMigrator.readVersion(db.writer)).toBe(10);
+    expect(OctoPunkDatabaseMigrator.readVersion(db.writer)).toBe(11);
     const teamRunsColumns = (
       db.writer.prepare("PRAGMA table_info(team_runs)").all() as { name: string }[]
     ).map((row) => row.name);
@@ -36,10 +36,18 @@ describe("migrations", () => {
     expect(teamRunsColumns).toContain("archived_at");
     expect(teamRunsColumns).toContain("session_id");
     expect(teamRunsColumns).toContain("gate_snapshot_json");
+    // v11: scheduling controls (priority for quota ordering, paused_at).
+    expect(teamRunsColumns).toContain("priority");
+    expect(teamRunsColumns).toContain("paused_at");
     const childTasksColumns = (
       db.writer.prepare("PRAGMA table_info(child_tasks)").all() as { name: string }[]
     ).map((row) => row.name);
     expect(childTasksColumns).toContain("model");
+    const taskAttemptsColumns = (
+      db.writer.prepare("PRAGMA table_info(task_attempts)").all() as { name: string }[]
+    ).map((row) => row.name);
+    // v11: crash-recovery process reconciliation key.
+    expect(taskAttemptsColumns).toContain("pid");
     const tables = (
       db.writer
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -66,6 +74,9 @@ describe("migrations", () => {
       "arbitrations",
       "delivery_summaries",
       "pr_links",
+      // v11: doctor health-check reports.
+      "doctor_reports",
+      "doctor_check_items",
     ]) {
       expect(tables).toContain(expected);
     }
@@ -888,5 +899,294 @@ describe("arbitration, summaries and PR links", () => {
       .prepare("SELECT gate_snapshot_json AS json FROM team_runs WHERE id = ?")
       .get(runID) as { json: string | null };
     expect(row.json).toBe('{"reviewMode":"standard","maxRiskFindings":0}');
+  });
+});
+
+// ---- v0.3 stability & multi-run (specs/001-v03-stability-multi-teamrun) ----
+
+describe("run scheduling controls", () => {
+  it("rejects out-of-range priorities and records legal changes with audit and notification", async () => {
+    const { repository } = makeRepository();
+    const start = await repository.startTeam(startInput("pr1"));
+    expect(start.run.priority).toBe(0);
+
+    for (const priority of [6, -6, 1.5, Number.NaN]) {
+      await expect(
+        repository.setRunPriority({ requestID: `pr-bad-${priority}`, runID: start.run.id, priority }),
+      ).rejects.toMatchObject({ kind: "invalidTask" });
+    }
+
+    const seenPriorities: number[] = [];
+    const stream = repository.observeRunSummary(start.run.id);
+    const pump = (async () => {
+      for await (const value of stream) {
+        seenPriorities.push(value.run.priority);
+      }
+    })();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const updated = await repository.setRunPriority({
+      requestID: "pr-ok-1",
+      runID: start.run.id,
+      priority: 3,
+    });
+    expect(updated.priority).toBe(3);
+    expect(updated.pausedAt).toBeNull();
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    stream.cancel();
+    await Promise.allSettled([pump]);
+    // The run observer emits both the initial and the re-prioritized value.
+    expect(seenPriorities).toContain(0);
+    expect(seenPriorities).toContain(3);
+
+    // Idempotent replay returns the cached run (same requestID).
+    const replay = await repository.setRunPriority({
+      requestID: "pr-ok-1",
+      runID: start.run.id,
+      priority: 3,
+    });
+    expect(stableStringify(replay)).toBe(stableStringify(updated));
+
+    // A same-value set is a no-op: current run returned, no duplicate event.
+    const noop = await repository.setRunPriority({
+      requestID: "pr-ok-2",
+      runID: start.run.id,
+      priority: 3,
+    });
+    expect(noop.priority).toBe(3);
+
+    const snapshot = await repository.snapshot(start.run.id);
+    const priorityEvents = snapshot.events.filter((event) => event.kind === "run.priorityChanged");
+    expect(priorityEvents).toHaveLength(1);
+    expect(priorityEvents[0].payload).toContain('"from":"0"');
+    expect(priorityEvents[0].payload).toContain('"to":"3"');
+
+    // Summaries and snapshots both surface the new priority.
+    const summaries = await repository.listRuns();
+    expect(summaries[0].priority).toBe(3);
+    expect((await repository.snapshot(start.run.id)).run.priority).toBe(3);
+  });
+
+  it("pauses idempotently and resumes with audit events", async () => {
+    const { repository } = makeRepository();
+    const start = await repository.startTeam(startInput("pz1"));
+    expect(start.run.pausedAt).toBeNull();
+
+    const paused = await repository.pauseRun({ requestID: "pz2", runID: start.run.id });
+    expect(paused.pausedAt).not.toBeNull();
+
+    // Pausing an already-paused run (new request id) is idempotent: the
+    // current state returns and no second audit event is appended.
+    const pausedAgain = await repository.pauseRun({ requestID: "pz3", runID: start.run.id });
+    expect(pausedAgain.pausedAt).toBe(paused.pausedAt);
+
+    // Replaying the original pause request returns its cached response.
+    const replay = await repository.pauseRun({ requestID: "pz2", runID: start.run.id });
+    expect(stableStringify(replay)).toBe(stableStringify(paused));
+
+    let snapshot = await repository.snapshot(start.run.id);
+    expect(snapshot.events.filter((event) => event.kind === "run.paused")).toHaveLength(1);
+    expect(snapshot.run.pausedAt).toBe(paused.pausedAt);
+
+    const resumed = await repository.resumeRun({ requestID: "pz4", runID: start.run.id });
+    expect(resumed.pausedAt).toBeNull();
+
+    // Resuming a running run is likewise idempotent.
+    const resumedAgain = await repository.resumeRun({ requestID: "pz5", runID: start.run.id });
+    expect(resumedAgain.pausedAt).toBeNull();
+
+    snapshot = await repository.snapshot(start.run.id);
+    expect(snapshot.events.filter((event) => event.kind === "run.resumed")).toHaveLength(1);
+    expect(snapshot.run.pausedAt).toBeNull();
+
+    // Unknown runs are rejected, not silently ignored.
+    await expect(
+      repository.pauseRun({ requestID: "pz6", runID: "00000000-0000-0000-0000-000000000000" }),
+    ).rejects.toMatchObject({ kind: "runNotFound" });
+  });
+});
+
+describe("doctor reports", () => {
+  const item = (checkKey: "cli_path" | "login" | "gui_path" | "db_health", status: "pass" | "fail" | "unknown") => ({
+    checkKey,
+    status,
+    detail: `${checkKey} ${status}`,
+    impact: "impact",
+    suggestion: "suggestion",
+    durationMs: 12,
+  });
+
+  it("records idempotent reports and derives overall (fail / unknown-only / all pass)", async () => {
+    const { repository, db } = makeRepository();
+    expect(await repository.getLatestDoctorReport("/tmp/repo")).toBeNull();
+
+    // Any fail → fail, even alongside passes.
+    const failing = await repository.recordDoctorReport({
+      requestID: "doc-1",
+      triggeredBy: "user",
+      repositoryPath: "/tmp/repo",
+      items: [item("cli_path", "pass"), item("login", "fail")],
+    });
+    expect(failing.overall).toBe("fail");
+    expect(failing.items).toHaveLength(2);
+    expect(failing.items[0].reportID).toBe(failing.id);
+
+    // No fail but at least one unknown → degraded.
+    const degraded = await repository.recordDoctorReport({
+      requestID: "doc-2",
+      triggeredBy: "prestart",
+      repositoryPath: "/tmp/repo",
+      items: [item("gui_path", "unknown")],
+    });
+    expect(degraded.overall).toBe("degraded");
+
+    // All pass → pass; a NULL repository path covers the global checks.
+    const passing = await repository.recordDoctorReport({
+      requestID: "doc-3",
+      triggeredBy: "codex",
+      repositoryPath: null,
+      items: [item("db_health", "pass")],
+    });
+    expect(passing.overall).toBe("pass");
+    expect(passing.repositoryPath).toBeNull();
+
+    // Same requestID → cached report, no duplicate rows.
+    const replay = await repository.recordDoctorReport({
+      requestID: "doc-1",
+      triggeredBy: "user",
+      repositoryPath: "/tmp/repo",
+      items: [item("cli_path", "pass"), item("login", "fail")],
+    });
+    expect(stableStringify(replay)).toBe(stableStringify(failing));
+    const counted = db.writer
+      .prepare("SELECT COUNT(*) AS n FROM doctor_reports")
+      .get() as { n: number };
+    expect(counted.n).toBe(3);
+
+    // Latest per repository scope: the degraded report is newest for /tmp/repo.
+    const latest = await repository.getLatestDoctorReport("/tmp/repo");
+    expect(latest?.id).toBe(degraded.id);
+    expect(latest?.items.map((entry) => entry.status)).toEqual(["unknown"]);
+    // The global (NULL) scope never leaks repository-scoped rows and vice versa.
+    expect((await repository.getLatestDoctorReport(null))?.id).toBe(passing.id);
+    expect(await repository.getLatestDoctorReport("/tmp/other")).toBeNull();
+  });
+
+  it("reruns a single check item and recalculates overall", async () => {
+    const { repository } = makeRepository();
+    const report = await repository.recordDoctorReport({
+      requestID: "rr-1",
+      triggeredBy: "user",
+      repositoryPath: "/tmp/repo",
+      items: [item("login", "fail"), item("cli_path", "pass")],
+    });
+    expect(report.overall).toBe("fail");
+
+    const updated = await repository.rerunDoctorCheckItem({
+      requestID: "rr-2",
+      reportID: report.id,
+      checkKey: "login",
+      status: "pass",
+      detail: "login ok now",
+      impact: "none",
+      suggestion: "none",
+      durationMs: 5,
+    });
+    expect(updated.overall).toBe("pass");
+    const login = updated.items.find((entry) => entry.checkKey === "login");
+    expect(login?.status).toBe("pass");
+    expect(login?.detail).toBe("login ok now");
+    expect(login?.durationMs).toBe(5);
+    // The untouched item keeps its original verdict.
+    expect(updated.items.find((entry) => entry.checkKey === "cli_path")?.status).toBe("pass");
+
+    // The recalculated overall is persisted on the report row.
+    expect((await repository.getLatestDoctorReport("/tmp/repo"))?.overall).toBe("pass");
+
+    // Idempotent replay returns the cached report.
+    const replay = await repository.rerunDoctorCheckItem({
+      requestID: "rr-2",
+      reportID: report.id,
+      checkKey: "login",
+      status: "pass",
+      detail: "login ok now",
+      impact: "none",
+      suggestion: "none",
+      durationMs: 5,
+    });
+    expect(stableStringify(replay)).toBe(stableStringify(updated));
+
+    // Unknown report or unknown check key → invalidTask.
+    const missing = { status: "pass" as const, detail: "d", impact: "i", suggestion: "s", durationMs: 1 };
+    await expect(
+      repository.rerunDoctorCheckItem({
+        requestID: "rr-3",
+        reportID: "00000000-0000-0000-0000-000000000000",
+        checkKey: "login",
+        ...missing,
+      }),
+    ).rejects.toMatchObject({ kind: "invalidTask" });
+    await expect(
+      repository.rerunDoctorCheckItem({ requestID: "rr-4", reportID: report.id, checkKey: "sandbox", ...missing }),
+    ).rejects.toMatchObject({ kind: "invalidTask" });
+  });
+});
+
+describe("attempt pid", () => {
+  it("writes and clears pids with task ownership checks", async () => {
+    const { repository, db } = makeRepository();
+    const { runID, taskID } = await makeRunWithTask(repository, "pid");
+    const running = await repository.markTaskRunning({
+      requestID: "pid-r1",
+      runID,
+      taskID,
+      sessionID: null,
+    });
+    const attemptID = running.currentAttemptID as string;
+    const pidOf = (id: string): number | null =>
+      (db.writer.prepare("SELECT pid FROM task_attempts WHERE id = ?").get(id) as { pid: number | null })
+        .pid;
+
+    expect(pidOf(attemptID)).toBeNull();
+    await repository.updateAttemptPid({ runID, taskID, attemptID, pid: 4242 });
+    expect(pidOf(attemptID)).toBe(4242);
+
+    // Clean exit clears the pid back to NULL.
+    await repository.updateAttemptPid({ runID, taskID, attemptID, pid: null });
+    expect(pidOf(attemptID)).toBeNull();
+
+    // Ownership: an attempt of another task never matches, and its pid stays untouched.
+    const other = await repository.delegateTask({
+      requestID: "pid-r2",
+      runID,
+      title: "Other",
+      prompt: "Other",
+      agentKind: "codex",
+      model: null,
+      executionMode: "read_only",
+      dependencies: [],
+    });
+    const otherRunning = await repository.markTaskRunning({
+      requestID: "pid-r3",
+      runID,
+      taskID: other.id,
+      sessionID: null,
+    });
+    const otherAttemptID = otherRunning.currentAttemptID as string;
+    await repository.updateAttemptPid({ runID, taskID: other.id, attemptID: otherAttemptID, pid: 777 });
+    await expect(
+      repository.updateAttemptPid({ runID, taskID, attemptID: otherAttemptID, pid: 1 }),
+    ).rejects.toMatchObject({ kind: "invalidTask" });
+    expect(pidOf(otherAttemptID)).toBe(777);
+    // A fully unknown attempt id is rejected the same way.
+    await expect(
+      repository.updateAttemptPid({
+        runID,
+        taskID,
+        attemptID: "00000000-0000-0000-0000-000000000000",
+        pid: 1,
+      }),
+    ).rejects.toMatchObject({ kind: "invalidTask" });
   });
 });

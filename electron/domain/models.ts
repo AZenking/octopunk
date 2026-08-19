@@ -44,6 +44,15 @@ export function runStatusIsTerminal(status: TeamRunStatus): boolean {
   return status === "completed" || status === "blocked" || status === "cancelled" || status === "failed";
 }
 
+/** Scheduling priority bounds (specs/001 data-model: team_runs.priority -5..5). */
+export const RUN_PRIORITY_MIN = -5;
+export const RUN_PRIORITY_MAX = 5;
+
+/** Integer within [-5, 5]; the port layer rejects anything else. */
+export function isValidRunPriority(priority: number): boolean {
+  return Number.isInteger(priority) && priority >= RUN_PRIORITY_MIN && priority <= RUN_PRIORITY_MAX;
+}
+
 export const CHILD_TASK_STATUSES = [
   "queued",
   "running",
@@ -150,6 +159,10 @@ export interface TeamRun {
   updatedAt: number;
   /** Epoch seconds when the run moved to the archived section; null = active. */
   archivedAt: number | null;
+  /** Scheduling priority (quota ordering: priority DESC, created_at ASC). */
+  priority: number;
+  /** Pause timestamp; null = not paused. Pausing only stops new quota grants. */
+  pausedAt: number | null;
 }
 
 export function makeTeamRun(init: {
@@ -167,6 +180,8 @@ export function makeTeamRun(init: {
   createdAt?: number;
   updatedAt?: number;
   archivedAt?: number | null;
+  priority?: number;
+  pausedAt?: number | null;
 }): TeamRun {
   const now = Date.now() / 1000;
   return {
@@ -187,6 +202,8 @@ export function makeTeamRun(init: {
     createdAt: init.createdAt ?? now,
     updatedAt: init.updatedAt ?? now,
     archivedAt: init.archivedAt ?? null,
+    priority: Math.max(RUN_PRIORITY_MIN, Math.min(init.priority ?? 0, RUN_PRIORITY_MAX)),
+    pausedAt: init.pausedAt ?? null,
   };
 }
 
@@ -389,6 +406,8 @@ export interface TeamRunSummary {
   repositoryPath: string;
   task: string;
   status: TeamRunStatus;
+  /** Scheduling priority mirror of TeamRun.priority (quota ordering). */
+  priority: number;
   taskCount: number;
   acceptedTaskCount: number;
   updatedAt: number;
@@ -653,6 +672,99 @@ export function makeDeliverySummary(init: {
     verdict: init.verdict,
     summaryMD: init.summaryMD ?? "",
     evidence: init.evidence ?? [],
+    createdAt: init.createdAt ?? Date.now() / 1000,
+  };
+}
+
+// ---- v0.3 stability & multi-run (specs/001-v03-stability-multi-teamrun) ----
+// Scheduling/doctor/recovery vocabulary. Same conventions as above:
+// string-literal unions with helper tables, epoch-second timestamps, UUID ids.
+
+/** Per-check identifiers (specs/001 data-model: doctor_check_items.check_key). */
+export const DOCTOR_CHECK_KEYS = [
+  "cli_path",
+  "gui_path",
+  "login",
+  "mcp_stdio",
+  "git_repo",
+  "worktree_disk",
+  "sandbox",
+  "provider_quota",
+  "db_health",
+] as const;
+export type DoctorCheckKey = (typeof DOCTOR_CHECK_KEYS)[number];
+
+/** `unknown` marks timeout/unverifiable checks; it never equals a pass. */
+export const DOCTOR_CHECK_STATUSES = ["pass", "fail", "unknown"] as const;
+export type DoctorCheckStatus = (typeof DOCTOR_CHECK_STATUSES)[number];
+
+export const DOCTOR_OVERALLS = ["pass", "fail", "degraded"] as const;
+export type DoctorOverall = (typeof DOCTOR_OVERALLS)[number];
+
+/** Who asked for the check: human, MCP caller, or the startup pre-flight. */
+export const DOCTOR_TRIGGERED_BY = ["user", "codex", "prestart"] as const;
+export type DoctorTriggeredBy = (typeof DOCTOR_TRIGGERED_BY)[number];
+
+/**
+ * Roll-up rule (contract C6): any `fail` → `fail`; no fail but at least one
+ * `unknown` → `degraded`; otherwise `pass`. Structural input so port-side
+ * rows and DTOs both satisfy it.
+ */
+export function doctorOverallOf(items: readonly { status: DoctorCheckStatus }[]): DoctorOverall {
+  let hasUnknown = false;
+  for (const item of items) {
+    if (item.status === "fail") return "fail";
+    if (item.status === "unknown") hasUnknown = true;
+  }
+  return hasUnknown ? "degraded" : "pass";
+}
+
+/** Recovery classification of one non-terminal leftover (specs/001 recovery view). */
+export const RECOVERY_ACTION_KINDS = [
+  "interrupted",
+  "process_alive",
+  "orphan_worktree",
+  "orphan_branch",
+  "stale_lock",
+] as const;
+export type RecoveryActionKind = (typeof RECOVERY_ACTION_KINDS)[number];
+
+/** One row of the recovery view: non-terminal run × process check × orphan scan. */
+export interface RecoveryItem {
+  id: string;
+  kind: RecoveryActionKind;
+  /** Non-terminal run the item belongs to; null for run-less orphans. */
+  runID: string | null;
+  taskID: string | null;
+  attemptID: string | null;
+  /** Worktree path, branch name, or lock target the item refers to. */
+  target: string;
+  detail: string;
+  /** Recommended remediation rendered next to the explicit confirm action. */
+  suggestion: string;
+  createdAt: number;
+}
+
+export function makeRecoveryItem(init: {
+  id?: string;
+  kind: RecoveryActionKind;
+  runID?: string | null;
+  taskID?: string | null;
+  attemptID?: string | null;
+  target: string;
+  detail?: string;
+  suggestion?: string;
+  createdAt?: number;
+}): RecoveryItem {
+  return {
+    id: init.id ?? randomUUID(),
+    kind: init.kind,
+    runID: init.runID ?? null,
+    taskID: init.taskID ?? null,
+    attemptID: init.attemptID ?? null,
+    target: init.target,
+    detail: init.detail ?? "",
+    suggestion: init.suggestion ?? "",
     createdAt: init.createdAt ?? Date.now() / 1000,
   };
 }

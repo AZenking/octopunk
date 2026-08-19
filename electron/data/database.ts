@@ -8,7 +8,7 @@ import Database from "better-sqlite3";
 export type SqliteDatabase = Database.Database;
 
 export const OctoPunkDatabaseMigrator = {
-  currentVersion: 10,
+  currentVersion: 11,
 
   migrate(db: SqliteDatabase): void {
     const currentVersion = OctoPunkDatabaseMigrator.readVersion(db);
@@ -356,6 +356,41 @@ export const OctoPunkDatabaseMigrator = {
         CREATE INDEX delivery_summaries_task_idx ON delivery_summaries(task_id);
       `);
       updateSchemaVersion(db, "10");
+    },
+
+    11(db: SqliteDatabase): void {
+      // v0.3 stability & multi-run: run scheduling controls (priority for
+      // quota ordering, paused_at where NULL = not paused — pausing only
+      // stops new quota grants, not in-flight tasks), the child PID on each
+      // attempt for crash-recovery process reconciliation, and doctor
+      // health-check reports with their per-check items.
+      db.exec(`
+        ALTER TABLE team_runs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE team_runs ADD COLUMN paused_at REAL;
+        ALTER TABLE task_attempts ADD COLUMN pid INTEGER;
+
+        CREATE TABLE doctor_reports (
+            id TEXT PRIMARY KEY NOT NULL,
+            triggered_by TEXT NOT NULL,
+            repository_path TEXT,
+            overall TEXT NOT NULL,
+            created_at REAL NOT NULL
+        );
+
+        CREATE TABLE doctor_check_items (
+            id TEXT PRIMARY KEY NOT NULL,
+            report_id TEXT NOT NULL REFERENCES doctor_reports(id) ON DELETE CASCADE,
+            check_key TEXT NOT NULL,
+            status TEXT NOT NULL,
+            detail TEXT NOT NULL DEFAULT '',
+            impact TEXT NOT NULL DEFAULT '',
+            suggestion TEXT NOT NULL DEFAULT '',
+            duration_ms INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE INDEX doctor_check_items_report_idx ON doctor_check_items(report_id);
+      `);
+      updateSchemaVersion(db, "11");
     },
   } as Record<number, (db: SqliteDatabase) => void>,
 };

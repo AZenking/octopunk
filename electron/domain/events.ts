@@ -37,6 +37,12 @@ export const TeamEventKind = {
   runArchived: "run.archived",
   /** An archived run was restored to the active sidebar list. */
   runUnarchived: "run.unarchived",
+  /** The run was paused: new quota grants stop, in-flight tasks continue. */
+  runPaused: "run.paused",
+  /** A paused run resumed; queued tasks continue by priority. */
+  runResumed: "run.resumed",
+  /** The run's scheduling priority changed; payload carries old/new values. */
+  runPriorityChanged: "run.priorityChanged",
   /** Batch of line-anchored review comments persisted (specs/002 v0.4 review center). */
   reviewCommentAdded: "review.comment_added",
   /** A review comment moved open → resolved/dismissed/line_changed (irreversible, audited). */

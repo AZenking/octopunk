@@ -7,6 +7,10 @@ import type {
   ChildAgentKind,
   ChildTask,
   DeliverySummary,
+  DoctorCheckKey,
+  DoctorCheckStatus,
+  DoctorOverall,
+  DoctorTriggeredBy,
   GateCheckKey,
   GateCheckStatus,
   GateOverall,
@@ -166,6 +170,36 @@ export interface PrLink {
   prURL: string;
   prNumber: number;
   lastSyncedAt: number;
+}
+
+// ---- v0.3 stability & multi-run (specs/001-v03-stability-multi-teamrun) ----
+
+/** Per-check doctor outcome (doctor_check_items rows). Pure data. */
+export interface DoctorReportItem {
+  id: string;
+  reportID: string;
+  checkKey: DoctorCheckKey;
+  /** `unknown` marks timeout/unverifiable checks; it never equals a pass. */
+  status: DoctorCheckStatus;
+  /** Conclusion summary (redacted ≤2 KiB; observed values on fail). */
+  detail: string;
+  /** Blast radius, e.g. "delegation will fail". */
+  impact: string;
+  /** Recommended remediation. */
+  suggestion: string;
+  durationMs: number;
+}
+
+/** Full doctor judgement with its per-check items (doctor_reports + items). */
+export interface DoctorReport {
+  id: string;
+  triggeredBy: DoctorTriggeredBy;
+  /** Repository the report targets; null covers the global checks. */
+  repositoryPath: string | null;
+  /** pass / fail / degraded — derived via doctorOverallOf at write time. */
+  overall: DoctorOverall;
+  items: DoctorReportItem[];
+  createdAt: number;
 }
 
 /** Minimal observation contract shared by all segmented queries (constitution I). */
@@ -410,6 +444,58 @@ export interface TeamRunRepository {
   getRunGateSnapshot(runID: string): Promise<string | null>;
   /** Freezes the run's effective gates into team_runs.gate_snapshot_json. */
   saveRunGateSnapshot(runID: string, snapshotJson: string): Promise<void>;
+  // ---- v0.3 stability & multi-run (specs/001-v03-stability-multi-teamrun) ----
+  /**
+   * Sets the run's scheduling priority (quota ordering: priority DESC,
+   * created_at ASC). Rejects out-of-range values with `DomainError.invalidTask`
+   * (isValidRunPriority); idempotent per requestID.
+   */
+  setRunPriority(input: { requestID: string; runID: string; priority: number }): Promise<TeamRun>;
+  /** Pauses the run: stops new quota grants only; in-flight tasks unaffected. */
+  pauseRun(input: { requestID: string; runID: string }): Promise<TeamRun>;
+  /** Resumes a paused run; queued tasks continue by priority. */
+  resumeRun(input: { requestID: string; runID: string }): Promise<TeamRun>;
+  /**
+   * Idempotent: replaying the same requestID returns the cached report. The
+   * overall is derived in the domain (doctorOverallOf), never trusted from input.
+   */
+  recordDoctorReport(input: {
+    requestID: string;
+    triggeredBy: DoctorTriggeredBy;
+    repositoryPath: string | null;
+    items: {
+      checkKey: DoctorCheckKey;
+      status: DoctorCheckStatus;
+      detail: string;
+      impact: string;
+      suggestion: string;
+      durationMs: number;
+    }[];
+  }): Promise<DoctorReport>;
+  /** Latest report for the repository; null queries the global reports. */
+  getLatestDoctorReport(repositoryPath: string | null): Promise<DoctorReport | null>;
+  /** Updates one item of the report and recalculates overall + updated time. */
+  rerunDoctorCheckItem(input: {
+    requestID: string;
+    reportID: string;
+    checkKey: DoctorCheckKey;
+    status: DoctorCheckStatus;
+    detail: string;
+    impact: string;
+    suggestion: string;
+    durationMs: number;
+  }): Promise<DoctorReport>;
+  /**
+   * Writes the attempt's child PID (set at spawn, cleared to null on clean
+   * exit) — the crash-recovery process reconciliation key. Throws unless the
+   * attempt belongs to the given task.
+   */
+  updateAttemptPid(input: {
+    runID: string;
+    taskID: string;
+    attemptID: string;
+    pid: number | null;
+  }): Promise<void>;
 }
 
 export type { TeamRun, TaskExecutionReport };

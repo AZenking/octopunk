@@ -84,3 +84,18 @@ export const PI_CHILD_MODEL_KEY = "OctoPunk.piChildModel";
  * 默认关闭。凭证由本机 gh CLI 自管,OctoPunk 不保存任何 GitHub 凭证。
  */
 export const GITHUB_FEEDBACK_ENABLED_KEY = "OctoPunk.githubFeedbackEnabled";
+/**
+ * 全局并发子进程上限(specs/001-v03 T004),十进制字符串,默认 6,钳制 1–20。
+ * 实际生效值 = min(全局, 项目, 单类型, run.maxConcurrentTasks)四级联检。
+ */
+export const GLOBAL_MAX_CHILDREN_KEY = "OctoPunk.globalMaxChildren";
+/** 单仓库并发子进程上限(specs/001-v03 T004),十进制字符串,默认 3,钳制 1–10。 */
+export const PER_PROJECT_MAX_CHILDREN_KEY = "OctoPunk.perProjectMaxChildren";
+/** 单 Agent 类型并发子进程上限(specs/001-v03 T004),十进制字符串,默认 3,钳制 1–10。 */
+export const PER_KIND_MAX_CHILDREN_KEY = "OctoPunk.perKindMaxChildren";
+/** 资源高压时暂缓发放新任务配额(specs/001-v03 T004),布尔字符串,默认开启。 */
+export const RESOURCE_PAUSE_ENABLED_KEY = "OctoPunk.resourcePauseEnabled";
+/** 高压判定最小剩余磁盘字节数(specs/001-v03 T004),十进制字符串,默认 1GiB(1073741824),下限 100MiB。 */
+export const MIN_FREE_DISK_BYTES_KEY = "OctoPunk.minFreeDiskBytes";
+/** 为交互式操作预留 1 个并发槽位(specs/001-v03 T004),布尔字符串,默认开启。 */
+export const INTERACTIVE_SLOT_RESERVED_KEY = "OctoPunk.interactiveSlotReserved";
