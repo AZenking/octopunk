@@ -25,6 +25,7 @@ import { AgentTeamApplicationService } from "./application/agentTeamService";
 import { TeamQueryService } from "./application/teamQueryService";
 import { ContextFetchService } from "./application/contextFetchService";
 import { ReviewCenterService } from "./application/reviewCenterService";
+import { QualityGateService } from "./application/qualityGateService";
 import { TaskEventHub } from "./domain/events";
 import { OctoPunkMCPServer } from "./mcp/server";
 import {
@@ -64,6 +65,7 @@ export class AppEnvironment {
   readonly teamService: AgentTeamApplicationService;
   readonly queryService: TeamQueryService;
   readonly reviewCenter: ReviewCenterService;
+  readonly qualityGate: QualityGateService;
   readonly contextFetch: ContextFetchService;
   readonly eventHub: TaskEventHub;
   readonly keychain: KeychainTokenStore;
@@ -137,6 +139,19 @@ export class AppEnvironment {
     });
     this.integration = new TaskIntegrationService(this.git);
     this.eventHub = new TaskEventHub();
+    // Quality Gate 与 Review Center 存在构造环:门禁判定需要 Review Center 的
+    // 两个只读视图,而 Review Center 的返工用例又需要 teamService(teamService
+    // 又要注入 qualityGate)。用延迟绑定的结构端口断环——箭头函数在调用期才读
+    // this.reviewCenter,届时它已完成构造。
+    this.qualityGate = new QualityGateService({
+      repository: this.repository,
+      git: this.git,
+      process: this.process,
+      reviewCenter: {
+        unresolvedFindings: (runID, taskID) => this.reviewCenter.unresolvedFindings(runID, taskID),
+        getDiffTree: (runID, taskID, side) => this.reviewCenter.getDiffTree(runID, taskID, side),
+      },
+    });
     this.teamService = new AgentTeamApplicationService({
       repository: this.repository,
       childExecution: this.childExecution,
@@ -147,6 +162,8 @@ export class AppEnvironment {
         taskRetryLimit: clampTaskRetryLimit(this.settings.string(TASK_RETRY_LIMIT_KEY)),
         launchStaggerSeconds: clampLaunchStaggerSeconds(this.settings.string(LAUNCH_STAGGER_SECONDS_KEY)),
       }),
+      // accept 前强制门禁判定 + 启动时配置快照(specs/002-v04 B 节 / R4)。
+      qualityGate: this.qualityGate,
     });
     this.queryService = new TeamQueryService(this.repository);
     // Review Center shares the same repository/git/teamService instances as the
@@ -181,6 +198,7 @@ export class AppEnvironment {
       readOnlyContext: this.contextFetch,
       defaultMaxConcurrentTasks: () => storedDefaultMaxConcurrentTasks(this.settings),
       reviewCenter: this.reviewCenter,
+      qualityGate: this.qualityGate,
     });
   }
 

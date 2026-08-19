@@ -71,12 +71,12 @@ description: "Task list for v0.4 Review Center 与质量门禁"
 
 **Independent Test**: quickstart.md 场景 2 —— 配置 4 项门禁,构造失败与豁免,验证明细输出与 accept 拦截/放行。
 
-- [ ] T016 [P] [US2] 门禁服务:`electron/application/qualityGateService.ts` —— 配置读写(项目默认 + TeamRun 启动覆盖快照写入 `team_runs.gate_snapshot_json`)、三类判定(状态类查 SQLite / Git 类走 GitPort / 命令类经 processAdapter 在任务 worktree 受控执行,超时标 unknown)、overall 计算(pass/fail/waived)、逐项 fix_suggestion(deps: T005)
-- [ ] T017 [US2] 豁免与 accept 集成:`waive` 逐项 + 理由 + 留痕,全失败项豁免后 overall 重算 waived;`accept_task` 前强制判定(fail 且有未豁免项即拒绝并返回明细)——修改 `electron/application/agentTeamService.ts` 与 `electron/mcp/server.ts` 的 accept 路径(deps: T016)
-- [ ] T018 [P] [US2] MCP + IPC:`set_gate_config` / `get_gate_config` / `run_quality_gate` / `waive_gate_item` 工具与 `gate:*` 通道白名单(幂等 request_id)(deps: T016)
-- [ ] T019 [P] [US2] UI:`GatePanel.tsx`(逐项明细、unknown 醒目、豁免操作)+ 设置页门禁配置表单(矛盾配置保存时按 policy 校验拒绝提示)+ 启动 TeamRun 时的覆盖入口(deps: T018)
-- [ ] T020 [US2] 测试:`tests/qualityGate.test.ts` —— 三类判定、命令超时 unknown、豁免重算、矛盾配置拒绝、evaluate 幂等重放、失败意见回传原会话格式(deps: T017)
-- [ ] T021 [US2] trace 扩展:`tools/mcp-trace.mjs` 增加 `--gate` / `--gate-fail-path` 驱动场景 2 端到端
+- [x] T016 [P] [US2] 门禁服务:`electron/application/qualityGateService.ts` —— 配置读写(项目默认 + TeamRun 启动覆盖快照写入 `team_runs.gate_snapshot_json`)、三类判定(状态类查 SQLite / Git 类走 GitPort / 命令类经 processAdapter 在任务 worktree 受控执行,超时标 unknown)、overall 计算(pass/fail/waived)、逐项 fix_suggestion(deps: T005)
+- [x] T017 [US2] 豁免与 accept 集成:`waive` 逐项 + 理由 + 留痕,全失败项豁免后 overall 重算 waived;`accept_task` 前强制判定(fail 且有未豁免项即拒绝并返回明细)——修改 `electron/application/agentTeamService.ts` 与 `electron/mcp/server.ts` 的 accept 路径(deps: T016)
+- [x] T018 [P] [US2] MCP + IPC:`set_gate_config` / `get_gate_config` / `run_quality_gate` / `waive_gate_item` 工具与 `gate:*` 通道白名单(幂等 request_id)(deps: T016)
+- [x] T019 [P] [US2] UI:`GatePanel.tsx`(逐项明细、unknown 醒目、豁免操作)+ 设置页门禁配置表单(矛盾配置保存时按 policy 校验拒绝提示)+ 启动 TeamRun 时的覆盖入口(deps: T018)
+- [x] T020 [US2] 测试:`tests/qualityGate.test.ts` —— 三类判定、命令超时 unknown、豁免重算、矛盾配置拒绝、evaluate 幂等重放、失败意见回传原会话格式(deps: T017)
+- [x] T021 [US2] trace 扩展:`tools/mcp-trace.mjs` 增加 `--gate` / `--gate-fail-path` 驱动场景 2 端到端
 
 **Checkpoint**: US1 + US2 均独立可用;门禁永不返回裸布尔。
 

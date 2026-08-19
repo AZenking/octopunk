@@ -28,6 +28,7 @@ import { cn } from "@/lib/utils";
 import { CommentPanel } from "./CommentPanel";
 import { DiffTree } from "./DiffTree";
 import { DiffViewer, type CommentAnchor, type DiffSide } from "./DiffViewer";
+import { GatePanel } from "./GatePanel";
 
 const SIDE_TABS: { value: DiffSide; label: string }[] = [
   { value: "baseline", label: "基线" },
@@ -460,6 +461,7 @@ export function ReviewCenterView() {
                       onDraftClear={() => setCommentDraft(null)}
                     />
                     <SummaryPanel runID={selected.runID} taskID={selected.taskID} />
+                    <GatePanel runID={selected.runID} taskID={selected.taskID} />
                   </div>
                 </div>
               </div>

@@ -12,6 +12,7 @@ import { AppearanceSettings } from "@/features/settings/sections/AppearanceSetti
 import { AgentsSettings } from "@/features/settings/sections/AgentsSettings";
 import { ConnectionsSettings } from "@/features/settings/sections/ConnectionsSettings";
 import { CustomSettings } from "@/features/settings/sections/CustomSettings";
+import { GateSettings } from "@/features/settings/sections/GateSettings";
 
 export function SettingsView({ section }: { section: SettingsSection }) {
   const appState = useAppState();
@@ -37,6 +38,8 @@ export function SettingsView({ section }: { section: SettingsSection }) {
           <AgentsSettings />
         ) : section === "connections" ? (
           <ConnectionsSettings />
+        ) : section === "gate" ? (
+          <GateSettings />
         ) : (
           <CustomSettings />
         )}

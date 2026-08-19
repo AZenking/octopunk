@@ -38,6 +38,8 @@ import type {
   StartTeamInput,
   TeamRunRepository,
 } from "../domain/repositoryPort";
+import type { GateEvaluation } from "../domain/repositoryPort";
+import type { GateConfigInput } from "../domain/policy";
 import type { ChildExecutionService } from "./childExecutionService";
 import type { TaskIntegrationService } from "./taskIntegrationService";
 
@@ -50,6 +52,18 @@ interface ChildWork {
 export interface ExecutionPolicy {
   taskRetryLimit: number;
   launchStaggerSeconds: number;
+}
+
+/**
+ * Quality Gate 结构性端口(可选注入,照 executionPolicy 的模式;QualityGateService
+ * 结构性满足本接口,无需相互 import)。承担两件事:启动时把生效门禁冻结成运行
+ * 快照(R4),以及 accept 前的强制门禁判定(interfaces.md B 节)。未注入(测试或
+ * 最小组合根)时启动不落快照(判定期回退项目默认)、accept 走原流程。
+ */
+export interface QualityGatePort {
+  snapshotForRun(runID: string, override: GateConfigInput | null): Promise<void>;
+  evaluate(input: { requestID: string; runID: string; taskID: string }): Promise<GateEvaluation>;
+  latestEvaluation(runID: string, taskID: string): Promise<GateEvaluation | null>;
 }
 
 /** Exponential backoff between automatic retries: 5s, 15s, 45s… capped at 60s. */
@@ -90,6 +104,9 @@ export class AgentTeamApplicationService {
   private readonly integration: TaskIntegrationService;
   private readonly eventHub: TaskEventHub | null;
   private readonly executionPolicy?: () => ExecutionPolicy | null;
+  // 命名避开 AgentTeamServicePortLike.qualityGate:那是 MCP 组合根经 Object.create
+  // 委托挂上的完整 QualityGateService 透传字段,与本处的结构性私有端口不同物。
+  private readonly qualityGatePort?: QualityGatePort;
   private childWork = new Map<string, ChildWork>();
   /** Includes a reservation while `launch` is awaiting the database write. */
   private childRunIDs = new Map<string, string>();
@@ -105,16 +122,29 @@ export class AgentTeamApplicationService {
     integration: TaskIntegrationService;
     eventHub?: TaskEventHub | null;
     executionPolicy?: () => ExecutionPolicy | null;
+    qualityGate?: QualityGatePort | null;
   }) {
     this.repository = input.repository;
     this.childExecution = input.childExecution;
     this.integration = input.integration;
     this.eventHub = input.eventHub ?? null;
     this.executionPolicy = input.executionPolicy;
+    this.qualityGatePort = input.qualityGate ?? undefined;
   }
 
-  async startTeam(input: StartTeamInput): Promise<import("../../shared/dtos").TeamStatusDTO> {
+  async startTeam(
+    input: StartTeamInput & { gateOverride?: GateConfigInput | null },
+  ): Promise<import("../../shared/dtos").TeamStatusDTO> {
     const result = await this.repository.startTeam(input);
+    if (this.qualityGatePort != null) {
+      // R4:启动即把生效门禁(项目默认 ⊕ gateOverride)冻结进 gate_snapshot_json,
+      // 此后项目默认的修改不再影响本 run。尽力而为:快照失败(如合并后才暴露的
+      // 矛盾组合被保存校验拒绝)不阻断启动——run 判定期会回退读取项目默认,问题
+      // 在 run_quality_gate/accept 阶段显式暴露,优于让门禁问题卡死整个编排。
+      await this.qualityGatePort
+        .snapshotForRun(result.run.id, input.gateOverride ?? null)
+        .catch(() => undefined);
+    }
     this.startEventMonitor(result.run.id);
     return teamStatusDTO(result);
   }
@@ -292,6 +322,9 @@ export class AgentTeamApplicationService {
     const snapshot = await this.repository.snapshot(input.runID);
     const task = snapshot.tasks.find((candidate) => candidate.id === input.taskID);
     if (task == null) throw DomainError.taskNotFound(input.taskID);
+    // 契约 B 节(interfaces.md):accept 成功路径前强制门禁判定,放在集成/状态
+    // 变更之前,让门禁失败成为最廉价的失败。
+    await this.assertAcceptGate(input);
     if (task.executionMode !== "workspace_write") {
       const accepted = await this.repository.acceptTask(input);
       await this.launchReadyTasks(input.runID);
@@ -315,6 +348,34 @@ export class AgentTeamApplicationService {
       })
       .catch(() => null);
     throw DomainError.invalidTask(`Integration conflict: ${result.details}`);
+  }
+
+  /**
+   * accept 前的强制门禁判定(interfaces.md B 节;错误会被 IPC/MCP 透传给调用方):
+   * 已有任何历史判定时读最近一条——豁免(waive)只改写既有判定,重跑会生成全新
+   * 未豁免项,若每次 accept 都强制重评,"豁免后放行"将永远无法达成;无历史判定
+   * 时才强制评一次(无配置 = 全 pass 平凡门禁,由 QualityGateService 保证)。
+   * overall=fail(即存在未豁免失败项)→ 拒绝并返回逐项明细;pass/waived → 放行。
+   */
+  private async assertAcceptGate(input: ReviewDecisionInput): Promise<void> {
+    if (this.qualityGatePort == null) return;
+    const latest = await this.qualityGatePort.latestEvaluation(input.runID, input.taskID);
+    const evaluation =
+      latest ??
+      (await this.qualityGatePort.evaluate({
+        // 前缀避免与 acceptTask 自身的 requestID 幂等缓存键冲突。
+        requestID: `accept-gate:${input.requestID}`,
+        runID: input.runID,
+        taskID: input.taskID,
+      }));
+    if (evaluation.overall !== "fail") return;
+    const lines = evaluation.items.map(
+      (item) => `- ${item.checkKey} [${item.id}]: ${item.status} — ${item.detail}`,
+    );
+    throw DomainError.invalidTask(
+      `accept_task 被质量门禁拒绝(overall=fail,判定 ${evaluation.id},存在未豁免失败项;` +
+        `逐项豁免请携带理由调用 waive_gate_item 后重试):\n${lines.join("\n")}`,
+    );
   }
 
   async blockTask(input: ReviewDecisionInput): Promise<import("../../shared/dtos").ChildTaskDTO> {

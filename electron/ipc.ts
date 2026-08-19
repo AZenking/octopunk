@@ -30,7 +30,8 @@ import {
   type ExecutionPolicyPayload,
   type MaxConcurrentTasksPayload,
 } from "../shared/ipc";
-import type { DiffPageDTO, DiffTreeEntryDTO } from "../shared/dtos";
+import type { DiffPageDTO, DiffTreeEntryDTO, GateConfigDTO, GateStartOverrideDTO } from "../shared/dtos";
+import type { GateConfigInput } from "./domain/policy";
 
 export interface RegisteredObservers {
   dispose: () => void;
@@ -38,6 +39,49 @@ export interface RegisteredObservers {
 
 /** Stable session identity for runs started from the Electron GUI itself. */
 export const LOCAL_UI_SESSION_ID = "local-ui";
+
+/**
+ * config_json 安全解码:解析失败/非对象视为无配置(null),与
+ * QualityGateService 内部的解码语义一致(该函数未导出,此处镜像)。
+ */
+function decodeGateConfigJSON(json: string | null): GateConfigInput | null {
+  if (json == null || json.trim().length === 0) return null;
+  try {
+    const parsed: unknown = JSON.parse(json);
+    if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return parsed as GateConfigInput;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 渲染层按完整 GateConfigDTO 解引用(config.checks.tests 等);MCP set_gate_config
+ * 允许保存部分字段的部分配置,回填前补齐缺省,避免渲染层解引用 undefined。
+ */
+function gateConfigDTOOf(config: GateConfigInput | null): GateConfigDTO | null {
+  if (config == null) return null;
+  const command = (key: "tests" | "lint" | "typecheck" | "build") => {
+    const value = config.checks?.[key];
+    return value == null ? null : { command: value.command, timeoutSeconds: value.timeoutSeconds };
+  };
+  return {
+    checks: {
+      tests: command("tests"),
+      lint: command("lint"),
+      typecheck: command("typecheck"),
+      build: command("build"),
+    },
+    maxRiskFindings: typeof config.maxRiskFindings === "number" ? config.maxRiskFindings : 0,
+    scopeAllowedPaths: Array.isArray(config.scopeAllowedPaths) ? config.scopeAllowedPaths : [],
+    requireDependenciesAccepted: config.requireDependenciesAccepted === true,
+    requireTargetBaselineSafe: config.requireTargetBaselineSafe === true,
+    requiredReviewers: Array.isArray(config.requiredReviewers) ? config.requiredReviewers : [],
+    manualConfirmHighRisk: config.manualConfirmHighRisk === true,
+    requireTodoClean: config.requireTodoClean === true,
+    reviewMode: config.reviewMode ?? "standard",
+  };
+}
 
 function clampMaxConcurrentTasks(value: unknown): number | null {
   const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
@@ -74,6 +118,8 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
       task: string;
       maxReviewRounds: number;
       maxConcurrentTasks?: number;
+      /** StartForm 收集的门禁覆盖;null = 沿用项目默认(specs/002-v04 §C)。 */
+      gateOverride?: GateStartOverrideDTO | null;
     };
     const inspection = await environment.git.inspect(request.repositoryPath);
     const dto = await environment.teamService.startTeam({
@@ -90,6 +136,8 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
         clampMaxConcurrentTasks(request.maxConcurrentTasks) ??
         storedMaxConcurrentTasks(environment),
       maxReviewRounds: request.maxReviewRounds,
+      // 主进程在启动事务成功后把 项目默认 ⊕ 覆盖 冻结成运行快照(R4)。
+      gateOverride: request.gateOverride ?? null,
     });
     return { run: dto.run, inspection };
   });
@@ -244,6 +292,57 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
     return environment.reviewCenter.unresolvedFindings(request.runID, request.taskID);
   });
 
+  // Quality Gate(specs/002-v04 interfaces.md §C):与 MCP gate 工具共享同一
+  // QualityGateService,GUI 与 MCP 对同一输入产生同构结果(契约不变量 1)。
+  handle("gate:get-config", async (payload) => {
+    const request = payload as { repositoryPath: string; runID?: string | null };
+    const project = await environment.repository.getGateConfig(request.repositoryPath);
+    const def = decodeGateConfigJSON(project?.configJson ?? null);
+    // 带 runID 时返回该 run 冻结的生效快照(启动后项目默认修改不影响);否则生效
+    // 配置即项目默认。
+    const effective =
+      request.runID != null && request.runID.length > 0
+        ? await environment.qualityGate.getEffectiveConfig(request.runID)
+        : def;
+    return { default: gateConfigDTOOf(def), effective: gateConfigDTOOf(effective) };
+  });
+
+  handle("gate:set-config", async (payload) => {
+    const request = payload as { repositoryPath: string; config: GateConfigInput };
+    await environment.qualityGate.saveProjectDefault(
+      randomUUID(),
+      request.repositoryPath,
+      request.config,
+    );
+    return null;
+  });
+
+  handle("gate:evaluate", (payload) => {
+    const request = payload as { requestID: string; runID: string; taskID: string };
+    return environment.qualityGate.evaluate({
+      requestID: request.requestID,
+      runID: request.runID,
+      taskID: request.taskID,
+    });
+  });
+
+  handle("gate:waive-item", (payload) => {
+    const request = payload as {
+      requestID: string;
+      evaluationID: string;
+      itemID: string;
+      waivedReason: string;
+    };
+    return environment.qualityGate.waive({
+      requestID: request.requestID,
+      evaluationID: request.evaluationID,
+      itemID: request.itemID,
+      // GUI 侧豁免主体固定为用户(MCP 侧为 "codex");理由必填由服务层校验。
+      waivedBy: "user",
+      waivedReason: request.waivedReason,
+    });
+  });
+
   handle("team:join", (payload) => {
     const request = payload as { runID: string; batchID: string };
     return environment.teamService.joinTasks({
@@ -254,7 +353,7 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
     });
   });
 
-  handle("team:review", (payload) => {
+  handle("team:review", async (payload) => {
     const request = payload as {
       action: "accept" | "rework" | "block";
       runID: string;
@@ -272,7 +371,20 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
       summary: request.summary.length === 0 ? "Reviewed in OctoPunk UI" : request.summary,
       findings: [],
     };
-    if (request.action === "accept") return environment.teamService.acceptTask(input);
+    if (request.action === "accept") {
+      const accepted = await environment.teamService.acceptTask(input);
+      // 契约 B 节:accept 成功后自动生成交付摘要。await + catch:摘要生成失败
+      // (如仓储抖动)不得拖垮已成功的 accept 结果,摘要可经 review:generate-summary
+      // 手动补生成。
+      await environment.reviewCenter
+        .generateDeliverySummary({
+          runID: request.runID,
+          taskID: request.taskID,
+          verdict: "PASS",
+        })
+        .catch(() => null);
+      return accepted;
+    }
     if (request.action === "rework") return environment.teamService.requestRework(input);
     return environment.teamService.blockTask(input);
   });

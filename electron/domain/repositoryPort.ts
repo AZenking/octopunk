@@ -370,6 +370,15 @@ export interface TeamRunRepository {
     waivedBy: string;
     waivedReason: string;
   }): Promise<GateEvaluationItem>;
+  /**
+   * Persists a recalculated overall (the service layer recomputes it from the
+   * full item list after a waiver) and re-reads the evaluation with its items.
+   * Only writes/audits when the overall actually changes.
+   */
+  updateGateEvaluationOverall(input: {
+    evaluationID: string;
+    overall: GateOverall;
+  }): Promise<GateEvaluation>;
   recordArbitration(input: {
     runID: string;
     taskID: string;
@@ -397,6 +406,8 @@ export interface TeamRunRepository {
     lastSyncedAt?: number;
   }): Promise<PrLink>;
   getPrLink(runID: string, taskID: string): Promise<PrLink | null>;
+  /** Reads the run's frozen gate snapshot; null when the run never saved one. */
+  getRunGateSnapshot(runID: string): Promise<string | null>;
   /** Freezes the run's effective gates into team_runs.gate_snapshot_json. */
   saveRunGateSnapshot(runID: string, snapshotJson: string): Promise<void>;
 }

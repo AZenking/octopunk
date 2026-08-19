@@ -17,6 +17,7 @@ import type {
   StartTeamInput,
 } from "../domain/repositoryPort";
 import type { ReviewCenterService } from "../application/reviewCenterService";
+import type { QualityGateService } from "../application/qualityGateService";
 
 /** Read-only live context supply for sub-agents (spec 001 FR-005…FR-008). */
 export interface ReadOnlyContextPort {
@@ -70,4 +71,11 @@ export interface AgentTeamServicePortLike {
    * Center tools answer with a readable error instead of failing to build.
    */
   reviewCenter?: ReviewCenterService;
+  /**
+   * Quality Gate use cases (config save, evaluate, waive) shared by GUI and
+   * MCP (constitution principle two). Optional like reviewCenter: until
+   * appEnvironment wires the instance the gate tools answer with a readable
+   * error instead of failing to build.
+   */
+  qualityGate?: QualityGateService;
 }

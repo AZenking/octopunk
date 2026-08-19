@@ -14,6 +14,7 @@ import {
 } from "react";
 import type {
   ChildTaskDTO,
+  GateStartOverrideDTO,
   TeamRunSummaryDTO,
 } from "../shared/dtos";
 import type {
@@ -93,7 +94,8 @@ export interface AppStateValue {
   codexAvailability: AvailabilityPayload | null;
   piAvailability: AvailabilityPayload | null;
   availability: (kind: ChildAgentKindValue) => AvailabilityPayload | null;
-  startTeam: () => Promise<void>;
+  /** 启动 TeamRun 时的轻量门禁覆盖(StartForm 收集;undefined = 不覆盖)。 */
+  startTeam: (gateOverride?: GateStartOverrideDTO) => Promise<void>;
   delegateChildTask: () => Promise<void>;
   delegateChildBatch: () => Promise<void>;
   refresh: () => Promise<void>;
@@ -433,7 +435,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     [claudeAvailability, codexAvailability, piAvailability],
   );
 
-  const startTeam = useCallback(async () => {
+  const startTeam = useCallback(async (gateOverride?: GateStartOverrideDTO) => {
     const path = repositoryPath.trim();
     try {
       const result = await window.octopunk.invoke<StartTeamResult>("team:start", {
@@ -441,6 +443,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         task: teamTask,
         maxReviewRounds,
         maxConcurrentTasks,
+        // 门禁覆盖随启动载荷传给主进程(未启用时为 null,沿用项目默认)。
+        gateOverride: gateOverride ?? null,
       });
       setSelectedRunID(result.run.id);
       if (!result.inspection.hasUncommittedChanges) {

@@ -469,6 +469,17 @@ export interface GateEvaluationItemDTO {
   waivedAt: EpochSeconds | null;
 }
 
+/** TeamRun 启动时的轻量门禁覆盖(StartForm 收集,随 team:start 传给主进程;
+ *  仅覆盖 maxRiskFindings/reviewMode/三个布尔开关。字段缺省(undefined)=不
+ *  覆盖,与主进程 mergeGateConfigs 的合并语义对齐;整体为 null = 沿用项目默认)。 */
+export interface GateStartOverrideDTO {
+  maxRiskFindings?: number;
+  reviewMode?: GateReviewMode;
+  requireDependenciesAccepted?: boolean;
+  requireTargetBaselineSafe?: boolean;
+  manualConfirmHighRisk?: boolean;
+}
+
 /** 交付摘要(delivery_summaries;accept 通过后自动生成)。 */
 export interface DeliverySummaryDTO {
   id: string;

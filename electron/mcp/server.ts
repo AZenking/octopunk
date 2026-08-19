@@ -15,6 +15,8 @@ import type { ContextFetchService } from "../application/contextFetchService";
 import { DEFAULT_MAX_CONCURRENT_TASKS } from "../../shared/ipc";
 import type { GitDiffSide, GitPort, KeychainPort } from "../application/ports";
 import type { ReviewCenterService, ReviewCommentInput } from "../application/reviewCenterService";
+import type { QualityGateService } from "../application/qualityGateService";
+import type { GateConfigInput } from "../domain/policy";
 import { TaskEventHub } from "../domain/events";
 import type { TaskEventUpdate } from "../domain/events";
 import { OctoPunkContextServer } from "../application/ports";
@@ -64,11 +66,15 @@ export class OctoPunkMCPServer {
     defaultMaxConcurrentTasks?: () => number;
     /** Review Center service; when present the review tools become available. */
     reviewCenter?: ReviewCenterService | null;
+    /** Quality Gate service; when present the gate tools become available. */
+    qualityGate?: QualityGateService | null;
   }) {
     // Prototype-chain delegation keeps reads live against the underlying
     // service instance while exposing the optional reviewCenter field.
     this.service = Object.create(input.service) as AgentTeamServicePortLike;
     this.service.reviewCenter = input.reviewCenter ?? undefined;
+    // Same delegation pattern for the gate service (see reviewCenter above).
+    this.service.qualityGate = input.qualityGate ?? undefined;
     this.git = input.git;
     this.keychain = input.keychain;
     this.eventHub = input.eventHub ?? null;
@@ -327,6 +333,43 @@ function reviewCommentsSchema(): Record<string, unknown> {
     },
   };
 }
+/** One command check (tests/lint/typecheck/build); null = check disabled. */
+function gateCommandConfigSchema(): Record<string, unknown> {
+  return {
+    type: ["object", "null"],
+    properties: { command: stringSchema(), timeoutSeconds: integerSchema() },
+    required: ["command"],
+  };
+}
+/**
+ * Gate config payload (contracts A 节 set_gate_config):camelCase keys, the
+ * domain GateConfigInput shape verbatim; partial fields = no override and
+ * contradictory combinations are rejected by the domain policy on save.
+ */
+function gateConfigSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      checks: {
+        type: "object",
+        properties: {
+          tests: gateCommandConfigSchema(),
+          lint: gateCommandConfigSchema(),
+          typecheck: gateCommandConfigSchema(),
+          build: gateCommandConfigSchema(),
+        },
+      },
+      maxRiskFindings: integerSchema(),
+      scopeAllowedPaths: arraySchema(),
+      requireDependenciesAccepted: { type: "boolean" },
+      requireTargetBaselineSafe: { type: "boolean" },
+      requiredReviewers: arraySchema(),
+      manualConfirmHighRisk: { type: "boolean" },
+      requireTodoClean: { type: "boolean" },
+      reviewMode: stringSchema(),
+    },
+  };
+}
 
 function tool(
   name: string,
@@ -464,6 +507,37 @@ export function fullToolList(): Tool[] {
         summary: stringSchema(),
       },
       ["request_id", "task_id", "comment_ids", "summary"],
+    ),
+    tool(
+      "set_gate_config",
+      "Save the project's default quality gate config (frozen into each run's snapshot at start_team). Contradictory combinations are rejected.",
+      {
+        request_id: stringSchema(),
+        repository_path: stringSchema(),
+        config: gateConfigSchema(),
+      },
+      ["request_id", "repository_path", "config"],
+    ),
+    tool(
+      "run_quality_gate",
+      `Run the quality gate evaluation for one task and persist the per-check details (a re-run creates a fresh evaluation). ${runIDNote}`,
+      {
+        request_id: stringSchema(),
+        run_id: stringSchema(),
+        task_id: stringSchema(),
+      },
+      ["request_id", "task_id"],
+    ),
+    tool(
+      "waive_gate_item",
+      "Waive one failed gate item (identified by evaluation_id + item_id) with a mandatory reason; once every fail item is waived the evaluation's overall becomes waived.",
+      {
+        request_id: stringSchema(),
+        evaluation_id: stringSchema(),
+        item_id: stringSchema(),
+        reason: stringSchema(),
+      },
+      ["request_id", "evaluation_id", "item_id", "reason"],
     ),
     tool(
       "accept_task",
@@ -779,9 +853,10 @@ async function dispatchTool(
     case "accept_task":
     case "block_task": {
       const verdict = name === "request_rework" ? "REWORK" : name === "accept_task" ? "PASS" : "BLOCKED";
+      const runID = await resolveRunID(service, arguments_, sessionID);
       const input = {
         requestID: requireString(arguments_, "request_id"),
-        runID: await resolveRunID(service, arguments_, sessionID),
+        runID,
         taskID: requireUUID(arguments_, "task_id"),
         reviewer: "codex",
         verdict: verdict as "PASS" | "REWORK" | "BLOCKED",
@@ -792,9 +867,50 @@ async function dispatchTool(
         return stableStringify(await service.requestRework(input));
       }
       if (name === "accept_task") {
-        return stableStringify(await service.acceptTask(input));
+        const accepted = await service.acceptTask(input);
+        // 契约 B 节:accept 成功后自动生成交付摘要;失败只吞掉,不影响 accept 的
+        // 返回(摘要在 get_task_review_context 中按需读取)。注意 accept 的门禁
+        // 拦截已在 service 层(T017)完成,此处错误透传为 isError,无需重复判定。
+        if (service.reviewCenter != null) {
+          await service.reviewCenter
+            .generateDeliverySummary({ runID, taskID: input.taskID, verdict: "PASS" })
+            .catch(() => null);
+        }
+        return stableStringify(accepted);
       }
       return stableStringify(await service.blockTask(input));
+    }
+    case "set_gate_config": {
+      const gate = requireQualityGate(service);
+      const config = gateConfigInput(arguments_.config);
+      await gate.saveProjectDefault(
+        requireString(arguments_, "request_id"),
+        requireString(arguments_, "repository_path"),
+        config,
+      );
+      return stableStringify(config);
+    }
+    case "run_quality_gate": {
+      const gate = requireQualityGate(service);
+      const evaluation = await gate.evaluate({
+        requestID: requireString(arguments_, "request_id"),
+        runID: await resolveRunID(service, arguments_, sessionID),
+        taskID: requireUUID(arguments_, "task_id"),
+      });
+      return stableStringify(evaluation);
+    }
+    case "waive_gate_item": {
+      const gate = requireQualityGate(service);
+      const evaluation = await gate.waive({
+        requestID: requireString(arguments_, "request_id"),
+        evaluationID: requireUUID(arguments_, "evaluation_id"),
+        itemID: requireUUID(arguments_, "item_id"),
+        // 豁免主体:dispatch 里的 sessionID 只用于定位 active run,不是稳定身份;
+        // MCP 侧的主 Agent 即 Codex,与 review 决策的 reviewer="codex" 保持一致。
+        waivedBy: "codex",
+        waivedReason: requireString(arguments_, "reason"),
+      });
+      return stableStringify(evaluation);
     }
     case "get_task_diff": {
       const review = requireReviewCenter(service);
@@ -1031,6 +1147,22 @@ function requireReviewCenter(service: AgentTeamServicePortLike): ReviewCenterSer
     throw new Error("Review Center tools are unavailable: the reviewCenter service is not wired in this build.");
   }
   return service.reviewCenter;
+}
+
+/** Gate tools share the team service port; until appEnvironment wires the instance they answer with a readable error. */
+function requireQualityGate(service: AgentTeamServicePortLike): QualityGateService {
+  if (service.qualityGate == null) {
+    throw new Error("Quality gate tools are unavailable: the qualityGate service is not wired in this build.");
+  }
+  return service.qualityGate;
+}
+
+/** MCP `config` 参数 → 领域 GateConfigInput:结构透传,字段校验(含矛盾组合)留给保存时的领域 policy。 */
+function gateConfigInput(value: unknown): GateConfigInput {
+  if (typeof value !== "object" || value == null || Array.isArray(value)) {
+    throw new InvalidParamsError("config must be a gate config object");
+  }
+  return value as GateConfigInput;
 }
 
 function diffSide(arguments_: Arguments): GitDiffSide {

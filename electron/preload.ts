@@ -3,6 +3,10 @@
 import { contextBridge, ipcRenderer } from "electron";
 
 const INVOKE_ALLOWLIST = new Set([
+  "gate:evaluate",
+  "gate:get-config",
+  "gate:set-config",
+  "gate:waive-item",
   "git:inspect",
   "team:start",
   "team:delegate-task",

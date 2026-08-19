@@ -1,9 +1,9 @@
 // Settings navigation metadata shared by the settings sidebar and the
 // detail view (title + one-line description per section).
 
-import { Bot, Cog, Palette, PenLine, Plug, type LucideIcon } from "lucide-react";
+import { Bot, Cog, Palette, PenLine, Plug, ShieldCheck, type LucideIcon } from "lucide-react";
 
-export type SettingsSection = "general" | "appearance" | "agents" | "connections" | "custom";
+export type SettingsSection = "general" | "appearance" | "agents" | "connections" | "gate" | "custom";
 
 export interface SettingsSectionMeta {
   id: SettingsSection;
@@ -36,6 +36,12 @@ export const SETTINGS_SECTIONS: readonly SettingsSectionMeta[] = [
     label: "连接与 MCP",
     icon: Plug,
     description: "管理 OctoPunk 作为 MCP 服务器的接入方式与外部连接（STDIO / HTTP）。",
+  },
+  {
+    id: "gate",
+    label: "质量门禁",
+    icon: ShieldCheck,
+    description: "按仓库配置质量门禁：命令检查、风险阈值、变更范围与审查模式。",
   },
   {
     id: "custom",

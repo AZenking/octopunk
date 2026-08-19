@@ -1371,6 +1371,47 @@ export class SqliteTeamRunRepository implements TeamRunRepository {
     }, [evaluationRow.run_id as string]);
   }
 
+  async updateGateEvaluationOverall(input: {
+    evaluationID: string;
+    overall: GateEvaluation["overall"];
+  }): Promise<GateEvaluation> {
+    // Notification scope needs the owning run before the transaction opens.
+    const evaluationRow = oneRow(
+      this.db,
+      "SELECT run_id FROM gate_evaluations WHERE id = ?",
+      input.evaluationID,
+    );
+    if (evaluationRow == null) {
+      throw DomainError.invalidTask(`Gate evaluation not found: ${input.evaluationID}`);
+    }
+    return this.write((db) => {
+      const row = oneRow(db, "SELECT * FROM gate_evaluations WHERE id = ?", input.evaluationID);
+      if (row == null) {
+        throw DomainError.invalidTask(`Gate evaluation not found: ${input.evaluationID}`);
+      }
+      // Persist + audit only on an actual change: an idempotent waive replay
+      // recomputes the same overall and must not spam duplicate gate events.
+      if (row.overall !== input.overall) {
+        db.prepare("UPDATE gate_evaluations SET overall = ? WHERE id = ?").run(
+          input.overall,
+          input.evaluationID,
+        );
+        appendEvent(db, {
+          runID: row.run_id as string,
+          taskID: row.task_id as string,
+          kind: TeamEventKind.gateEvaluated,
+          payload: encodeTeamEventPayload(
+            makeTeamEventPayload(`Quality gate ${input.overall} (recalculated after waiver)`, null, {
+              evaluation_id: input.evaluationID,
+            }),
+          ),
+        });
+      }
+      const updated = oneRow(db, "SELECT * FROM gate_evaluations WHERE id = ?", input.evaluationID);
+      return DatabaseMappers.gateEvaluation(updated as Row, gateItemsSync(db, input.evaluationID));
+    }, [evaluationRow.run_id as string]);
+  }
+
   async recordArbitration(input: {
     runID: string;
     taskID: string;
@@ -1529,6 +1570,13 @@ export class SqliteTeamRunRepository implements TeamRunRepository {
       taskID,
     );
     return row == null ? null : DatabaseMappers.prLink(row);
+  }
+
+  async getRunGateSnapshot(runID: string): Promise<string | null> {
+    const row = oneRow(this.db, "SELECT gate_snapshot_json FROM team_runs WHERE id = ?", runID);
+    if (row == null) throw DomainError.runNotFound(runID);
+    const value = row.gate_snapshot_json;
+    return typeof value === "string" && value.length > 0 ? value : null;
   }
 
   async saveRunGateSnapshot(runID: string, snapshotJson: string): Promise<void> {

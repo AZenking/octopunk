@@ -17,6 +17,14 @@
 //   node tools/mcp-trace.mjs --keep                   # never discard worktrees at the end
 //   node tools/mcp-trace.mjs --verbose                # full JSON payloads
 //   node tools/mcp-trace.mjs --list-only              # initialize + tools/list only
+//   node tools/mcp-trace.mjs --gate "tests=pnpm test,lint=pnpm exec eslint ."
+//     # quality-gate scenario (specs/002 quickstart 场景 2): set_gate_config before
+//     # start_team, run_quality_gate per awaiting report before accept; a failing
+//     # overall without --gate-waive proves accept_task interception (contract B).
+//   #   --gate-fail-path tests/broken.test.ts  # plant a marker file and force the
+//     # tests check to `test ! -f <marker>` so that item deterministically fails
+//   #   --gate-waive                          # waive each failing item (reason
+//     # "mcp-trace waiver"), re-evaluate to overall=waived, then accept
 
 import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -46,6 +54,9 @@ const flags = {
   verbose: false,
   listOnly: false,
   keep: false,
+  gateSpec: null, // "tests=pnpm test,lint=…" enables the quality-gate scenario (spec 002 场景 2)
+  gateFailPath: null, // repo-relative marker path; forces the injected tests check to fail
+  gateWaive: false, // waive failing items ("mcp-trace waiver"), re-evaluate, then accept
 };
 
 for (let index = 2; index < process.argv.length; index += 1) {
@@ -69,6 +80,9 @@ for (let index = 2; index < process.argv.length; index += 1) {
     case "--verbose": flags.verbose = true; break;
     case "--list-only": flags.listOnly = true; break;
     case "--keep": flags.keep = true; break;
+    case "--gate": flags.gateSpec = value(); break;
+    case "--gate-fail-path": flags.gateFailPath = value(); break;
+    case "--gate-waive": flags.gateWaive = true; break;
     default:
       console.error(`unknown flag: ${arg}`);
       process.exit(2);
@@ -82,6 +96,14 @@ if (!["read_only", "workspace_write"].includes(flags.mode)) {
   console.error(`--mode must be read_only or workspace_write`);
   process.exit(2);
 }
+if (flags.gateSpec != null && flags.gateSpec.trim().length === 0) {
+  console.error(`--gate must list at least one check, e.g. --gate "tests=pnpm test"`);
+  process.exit(2);
+}
+if ((flags.gateFailPath != null || flags.gateWaive) && flags.gateSpec == null) {
+  console.error(`--gate-fail-path / --gate-waive only make sense together with --gate`);
+  process.exit(2);
+}
 
 // ---------- pretty logging ----------
 
@@ -93,6 +115,7 @@ const brief = (value, limit = 110) => {
   const text = typeof value === "string" ? value : JSON.stringify(value);
   return text.length > limit ? text.slice(0, limit) + "…" : text;
 };
+const shellQuote = (text) => `'${text.replaceAll("'", `'\\''`)}'`;
 
 // ---------- throwaway repo ----------
 
@@ -180,9 +203,9 @@ class McpServer {
     });
   }
 
-  async call(name, args) {
+  async call(name, args, timeoutMs = 120000) {
     if (flags.verbose) line(`⇢ tools/call ${name} ${brief(args)}`);
-    const response = await this.request("tools/call", { name, arguments: args });
+    const response = await this.request("tools/call", { name, arguments: args }, timeoutMs);
     if (response.error) throw new Error(`${name}: ${response.error.message}`);
     const text = response.result?.content?.[0]?.text ?? "";
     if (response.result?.isError) throw new Error(`${name} failed: ${text}`);
@@ -209,6 +232,20 @@ function payloadPreview(raw) {
   }
 }
 
+/** One compact line per gate item: check_key / status / detail (+ fix suggestion). */
+function printGateEvaluation(evaluation) {
+  line(
+    `task ${evaluation.taskID.slice(0, 8)} gate overall=${evaluation.overall} ` +
+      `evaluation=${evaluation.id.slice(0, 8)} items=${evaluation.items.length}`,
+  );
+  for (const item of evaluation.items) {
+    line(`  ${item.checkKey.padEnd(17)} ${item.status.padEnd(7)} ${brief(item.detail ?? "", 84)}`);
+    if (item.status === "fail" && item.fixSuggestion != null) {
+      line(`  ${" ".repeat(17)} fix: ${brief(item.fixSuggestion, 84)}`);
+    }
+  }
+}
+
 // ---------- main ----------
 
 let temp = null;
@@ -230,6 +267,55 @@ if (flags.repo != null) {
   databaseURL = path.join(temp.dir, "trace.sqlite");
 }
 if (flags.db === "real") databaseURL = null;
+
+// ---------- quality-gate scenario prep (specs/002-v04-review-center-gates, quickstart 场景 2) ----------
+
+const GATE_COMMAND_KEYS = ["tests", "lint", "typecheck", "build"]; // policy.ts GATE_COMMAND_KEYS
+const GATE_CHECK_TIMEOUT_SECONDS = 120; // per-check ceiling (policy caps 1–600)
+
+/** Parse `--gate "tests=pnpm test,lint=…"` into GateCheckCommandInput entries. */
+function parseGateChecks(spec) {
+  const checks = {};
+  for (const part of spec.split(",")) {
+    const entry = part.trim();
+    if (entry.length === 0) continue;
+    const separator = entry.indexOf("=");
+    const key = separator > 0 ? entry.slice(0, separator).trim() : "";
+    const command = separator > 0 ? entry.slice(separator + 1).trim() : "";
+    if (!GATE_COMMAND_KEYS.includes(key) || command.length === 0 || checks[key] != null) {
+      console.error(`--gate entries must be ${GATE_COMMAND_KEYS.join("/")}=command, at most one each (got: "${entry}")`);
+      process.exit(2);
+    }
+    checks[key] = { command, timeoutSeconds: GATE_CHECK_TIMEOUT_SECONDS };
+  }
+  if (Object.keys(checks).length === 0) {
+    console.error(`--gate must configure at least one of ${GATE_COMMAND_KEYS.join("/")}`);
+    process.exit(2);
+  }
+  return checks;
+}
+
+const gateChecks = flags.gateSpec != null ? parseGateChecks(flags.gateSpec) : null;
+let gateFailNote = null;
+if (gateChecks != null && flags.gateFailPath != null) {
+  // --gate-fail-path deliberately breaks the `tests` check: write a marker file,
+  // then force that check to `test ! -f <marker>` (exits 1 while the file exists).
+  // The command pins the ABSOLUTE marker path because gate commands execute in
+  // the task worktree (data-model), where an uncommitted repo file would be
+  // invisible — this keeps the failure deterministic without committing to (or
+  // otherwise rewriting) the user's git history. Cleanup: throwaway repos are
+  // deleted wholesale in the finally block; a real repo is left untouched.
+  const markerPath = path.isAbsolute(flags.gateFailPath) ? flags.gateFailPath : path.join(repo, flags.gateFailPath);
+  fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+  fs.writeFileSync(
+    markerPath,
+    "# mcp-trace --gate-fail-path marker\n# The injected tests check runs `test ! -f` on this file; delete it to let the gate pass.\n",
+  );
+  gateFailNote =
+    `--gate-fail-path: marker planted at ${markerPath}; tests check ` +
+    (gateChecks.tests != null ? `overridden ("${gateChecks.tests.command}" → "test ! -f") to fail` : `injected as "test ! -f"`);
+  gateChecks.tests = { command: `test ! -f ${shellQuote(markerPath)}`, timeoutSeconds: GATE_CHECK_TIMEOUT_SECONDS };
+}
 
 const server = new McpServer(databaseURL);
 
@@ -257,7 +343,45 @@ try {
     process.exit(0);
   }
 
-  step(4, "start_team");
+  // Steps after tools/list number themselves so optional scenario steps
+  // (--gate) can slot in without renumbering the whole script by hand.
+  let stepNumber = 3;
+  const nextStep = (title) => {
+    stepNumber += 1;
+    return step(stepNumber, title);
+  };
+
+  if (gateChecks != null) {
+    nextStep("set_gate_config (project default gate)");
+    // Saved BEFORE start_team: the run freezes the effective gate (project
+    // default ⊕ overrides) into team_runs.gate_snapshot_json at start time,
+    // so saving later would not affect this run.
+    const saved = await server.call("set_gate_config", {
+      request_id: nextRequestID("gate-config"),
+      repository_path: repo,
+      config: {
+        checks: {
+          tests: gateChecks.tests ?? null,
+          lint: gateChecks.lint ?? null,
+          typecheck: gateChecks.typecheck ?? null,
+          build: gateChecks.build ?? null,
+        },
+        requireTargetBaselineSafe: true,
+        requireTodoClean: false,
+        reviewMode: "standard",
+      },
+    });
+    const activeChecks = Object.entries(gateChecks)
+      .map(([key, check]) => `${key}="${check.command}"`)
+      .join(", ");
+    line(`saved gate config for ${repo}`);
+    line(`  checks: ${activeChecks.length > 0 ? activeChecks : "(none)"}`);
+    line(`  requireTargetBaselineSafe=true requireTodoClean=false reviewMode=standard`);
+    if (gateFailNote != null) line(gateFailNote);
+    if (flags.verbose && saved != null) console.log(`  ${brief(saved)}`);
+  }
+
+  nextStep("start_team");
   const start = await server.call("start_team", {
     request_id: nextRequestID("start"),
     repository_path: repo,
@@ -269,7 +393,7 @@ try {
   const runID = start.run.id;
   line(`run ${runID.slice(0, 8)} status=${start.run.status} baseline=${start.run.baselineCommit.slice(0, 10)} target=${start.run.targetBranch || "detached"}`);
 
-  step(5, `delegate_tasks (${flags.tasks} × ${flags.agent}/${flags.mode}${flags.models.length > 0 ? `, models=[${flags.models.join(", ")}]` : ""})`);
+  nextStep(`delegate_tasks (${flags.tasks} × ${flags.agent}/${flags.mode}${flags.models.length > 0 ? `, models=[${flags.models.join(", ")}]` : ""})`);
   const items = Array.from({ length: flags.tasks }, (_, index) => ({
     client_key: `trace-${index + 1}`,
     title: `${flags.title ?? "Inspect"} #${index + 1}`,
@@ -292,7 +416,7 @@ try {
     line(`task ${task.id.slice(0, 8)} key=${task.clientKey} status=${task.status} workspace=${task.workspaceKind} model=${task.model ?? "-"}`);
   }
 
-  step(6, `monitor (poll every ${flags.pollMs}ms, live events below)`);
+  nextStep(`monitor (poll every ${flags.pollMs}ms, live events below)`);
   const cursor = new Map();
   const lastStatus = new Map();
   const deadline = Date.now() + flags.maxWaitSecs * 1000;
@@ -332,7 +456,7 @@ try {
     await sleep(flags.pollMs);
   }
 
-  step(7, `join_tasks (bounded ${flags.joinSecs}s)`);
+  nextStep(`join_tasks (bounded ${flags.joinSecs}s)`);
   const joined = await server.call("join_tasks", {
     run_id: runID,
     batch_id: batchID,
@@ -343,9 +467,65 @@ try {
     console.log(`  | ${row}`);
   }
 
+  // Latest evaluation per awaiting task; overall=fail (unwaived) drives the
+  // accept interception demo below (contract B: accept_task must refuse).
+  const gateOutcomes = new Map();
+  if (gateChecks != null && reviewable) {
+    nextStep("run_quality_gate (evaluate before accept)");
+    const awaitingTaskIDs = taskIDs.filter((id) => lastStatus.get(id) === "awaiting_report");
+    for (const taskID of awaitingTaskIDs) {
+      // Generous timeout: each configured check may run up to its own timeoutSeconds.
+      let evaluation = await server.call(
+        "run_quality_gate",
+        { request_id: nextRequestID("gate-eval"), run_id: runID, task_id: taskID },
+        600000,
+      );
+      printGateEvaluation(evaluation);
+      if (evaluation.overall === "fail" && flags.gateWaive) {
+        for (const item of evaluation.items.filter((item) => item.status === "fail")) {
+          // Contract invariant: waivers are per-item and must carry a reason.
+          const waived = await server.call("waive_gate_item", {
+            request_id: nextRequestID("gate-waive"),
+            evaluation_id: evaluation.id,
+            item_id: item.id,
+            reason: "mcp-trace waiver",
+          });
+          line(`  waived ${item.checkKey} → ${waived?.status ?? "waived"} (reason "mcp-trace waiver")`);
+        }
+        // Re-evaluate (a fresh evaluation, not a mutation) to confirm overall=waived.
+        evaluation = await server.call(
+          "run_quality_gate",
+          { request_id: nextRequestID("gate-reeval"), run_id: runID, task_id: taskID },
+          600000,
+        );
+        printGateEvaluation(evaluation);
+      }
+      gateOutcomes.set(taskID, evaluation);
+    }
+  }
+
   if (flags.accept && reviewable) {
-    step(8, "accept_task (PASS) per awaiting report");
+    nextStep("accept_task (PASS) per awaiting report");
+    let gateBlocked = false;
     for (const [index, taskID] of taskIDs.entries()) {
+      const gate = gateOutcomes.get(taskID);
+      if (gate != null && gate.overall === "fail" && !flags.gateWaive) {
+        // Interfaces.md B: accept_task must reject while unwaived failing items
+        // exist — surface the rejection as evidence instead of failing the trace.
+        try {
+          const accepted = await server.call("accept_task", {
+            request_id: nextRequestID("accept"),
+            run_id: runID,
+            task_id: taskID,
+            summary: `mcp-trace acceptance #${index + 1}`,
+          });
+          line(`task ${taskID.slice(0, 8)} → ${accepted.status} (UNEXPECTED: failing gate did not intercept)`);
+        } catch (error) {
+          gateBlocked = true;
+          line(`task ${taskID.slice(0, 8)} accept REJECTED by gate (expected): ${brief(error.message, 110)}`);
+        }
+        continue;
+      }
       const accepted = await server.call("accept_task", {
         request_id: nextRequestID("accept"),
         run_id: runID,
@@ -355,19 +535,23 @@ try {
       line(`task ${taskID.slice(0, 8)} → ${accepted.status}`);
     }
 
-    step(9, "complete_team (final PASS)");
-    const completed = await server.call("complete_team", {
-      request_id: nextRequestID("complete"),
-      run_id: runID,
-      final_verdict: "PASS",
-      summary: "mcp-trace final review",
-    });
-    line(`run → ${completed.run.status}`);
+    if (gateBlocked) {
+      nextStep("complete_team skipped (failing gate without --gate-waive blocks acceptance)");
+    } else {
+      nextStep("complete_team (final PASS)");
+      const completed = await server.call("complete_team", {
+        request_id: nextRequestID("complete"),
+        run_id: runID,
+        final_verdict: "PASS",
+        summary: "mcp-trace final review",
+      });
+      line(`run → ${completed.run.status}`);
+    }
   } else {
-    step(8, flags.accept ? "no awaiting_report task — skipping review" : "--no-accept — stopping before review");
+    nextStep(flags.accept ? "no awaiting_report task — skipping review" : "--no-accept — stopping before review");
   }
 
-  step(10, "final state");
+  nextStep("final state");
   const final = await server.call("get_team_status", { run_id: runID });
   line(`run ${final.run.id.slice(0, 8)} status=${final.run.status}`);
   for (const task of final.tasks) {
@@ -379,12 +563,12 @@ try {
 
   const cleanupMode = flags.keep ? "never" : flags.cleanup === "auto" ? (databaseURL != null ? "always" : "never") : flags.cleanup;
   if (cleanupMode === "always" && final.run.status !== "completed") {
-    step(11, "cleanup (cancel_team + discard_team)");
+    nextStep("cleanup (cancel_team + discard_team)");
     await server.call("cancel_team", { request_id: nextRequestID("cancel"), run_id: runID });
     await server.call("discard_team", { request_id: nextRequestID("discard"), run_id: runID });
     line("worktrees discarded");
   } else if (cleanupMode === "always" && final.run.status === "completed") {
-    step(11, "cleanup (completed run is retained by design)");
+    nextStep("cleanup (completed run is retained by design)");
   }
 
   console.log(`\n${"━".repeat(64)}`);
@@ -397,6 +581,8 @@ try {
   process.exitCode = 1;
 } finally {
   server.kill();
+  // --gate-fail-path markers live inside the repo dir: throwaway repos are
+  // removed wholesale here; a real repo (--repo …) is deliberately untouched.
   if (temp != null) {
     setTimeout(() => fs.rmSync(temp.dir, { recursive: true, force: true }), 1000).unref();
   }
