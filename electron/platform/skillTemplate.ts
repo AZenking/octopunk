@@ -1,13 +1,16 @@
 // Bundled OctoPunk skill content for orchestrating agents (Claude Code /
-// Codex), adapted per target. Embedded as TypeScript so the compiled main
+// Codex / Pi), adapted per target. Embedded as TypeScript so the compiled main
 // bundle always carries it (tsc does not copy .md resources). The body follows
 // the hand-maintained .zcode/skills/octopunk/SKILL.md; only the Connection
 // section and the version marker are generated per install.
 
 export type SkillTargetKind = "claude_code" | "codex" | "pi";
 
-/** Bump when rendered content changes; installed copies compare against it. */
-export const OCTOPUNK_SKILL_VERSION = 1;
+/**
+ * v2:正文补 pi(claude/codex 目录里的 v1 副本写于 pi 接入前,且当时未 bump
+ * 版本导致 update_available 永不触发)。内容变更必须 bump,否则旧副本不刷新。
+ */
+export const OCTOPUNK_SKILL_VERSION = 2;
 
 export function parseSkillVersion(content: string): number | null {
   const match = /<!--\s*octopunk-skill-version:\s*(\d+)\s*-->/.exec(content);
@@ -24,7 +27,7 @@ function shellQuote(value: string): string {
 
 const FRONTMATTER = `---
 name: octopunk
-description: Use the local OctoPunk MCP server to orchestrate controlled Claude or Codex sub-agent work, including TeamRuns, atomic batch delegation, parent and dependency trees, live task observation, join summaries, review, cancellation, resume, and Git worktree isolation. Trigger when the user asks to use OctoPunk, delegate sub-agents, run tasks in parallel, monitor child tasks, join results, or inspect execution logs.
+description: Use the local OctoPunk MCP server to orchestrate controlled Claude, Codex, or Pi sub-agent work, including TeamRuns, atomic batch delegation, parent and dependency trees, live task observation, join summaries, review, cancellation, resume, and Git worktree isolation. Trigger when the user asks to use OctoPunk, delegate sub-agents, run tasks in parallel, monitor child tasks, join results, or inspect execution logs.
 ---`;
 
 const CONNECTION_FALLBACK = `If \`octopunk\` tools are not available, state that the MCP is not connected and ask the user to restart/reconnect the app or configure the server. Do not silently fall back to another MCP server such as \`relaydesk\`, and do not claim that a child task was started.`;
@@ -122,7 +125,7 @@ Never automatically accept, discard, retry, push, or complete a run. Never expos
 
 ## Batch template
 
-Use this shape for a read-only parallel investigation:
+Use this shape for a read-only parallel investigation. Every task must set \`agent_kind\` — one of \`claude_code\`, \`codex\`, \`pi\` — and \`execution_mode\` — \`read_only\` or \`workspace_write\`:
 
 \`\`\`json
 {
@@ -135,6 +138,13 @@ Use this shape for a read-only parallel investigation:
       "title": "Find affected pages",
       "prompt": "Inspect the repository read-only and report exact files, routes and evidence.",
       "agent_kind": "claude_code",
+      "execution_mode": "read_only"
+    },
+    {
+      "client_key": "audit-roadmap",
+      "title": "Audit the roadmap with Pi",
+      "prompt": "Review the specified document read-only and report issues with file/line evidence.",
+      "agent_kind": "pi",
       "execution_mode": "read_only"
     },
     {

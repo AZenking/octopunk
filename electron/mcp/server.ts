@@ -20,7 +20,7 @@ import type { ReviewModeService } from "../application/reviewModeService";
 import type { RecoveryService } from "../application/recoveryService";
 import type { DoctorService } from "../application/doctorService";
 import type { GateConfigInput } from "../domain/policy";
-import { CHILD_AGENT_KINDS, type ChildAgentKind } from "../domain/models";
+import { CHILD_AGENT_KINDS, TASK_EXECUTION_MODES, type ChildAgentKind } from "../domain/models";
 import { TaskEventHub } from "../domain/events";
 import type { TaskEventUpdate } from "../domain/events";
 import { OctoPunkContextServer } from "../application/ports";
@@ -306,6 +306,13 @@ function arraySchema(): Record<string, unknown> {
 function booleanSchema(): Record<string, unknown> {
   return { type: "boolean" };
 }
+/** 枚举直出领域常量:客户端(如 Codex)从 tools/list 即可知合法值,无需依赖 Skill 文档。 */
+function agentKindSchema(): Record<string, unknown> {
+  return { type: "string", enum: [...CHILD_AGENT_KINDS] };
+}
+function executionModeSchema(): Record<string, unknown> {
+  return { type: "string", enum: [...TASK_EXECUTION_MODES] };
+}
 function taskReferenceSchema(): Record<string, unknown> {
   return {
     type: "object",
@@ -337,9 +344,9 @@ function delegateTasksSchema(): Record<string, unknown> {
         client_key: stringSchema(),
         title: stringSchema(),
         prompt: stringSchema(),
-        agent_kind: stringSchema(),
+        agent_kind: agentKindSchema(),
         model: stringSchema(),
-        execution_mode: stringSchema(),
+        execution_mode: executionModeSchema(),
         parent_task: taskReferenceSchema(),
         dependencies: { type: "array", items: taskReferenceSchema() },
         interactive: booleanSchema(),
@@ -439,15 +446,15 @@ export function fullToolList(): Tool[] {
     ),
     tool(
       "delegate_task",
-      `Delegate one task with an explicit agent kind and execution mode. ${runIDNote}`,
+      `Delegate one task to a child agent — agent_kind must be one of ${CHILD_AGENT_KINDS.join(", ")}; execution_mode must be read_only or workspace_write. ${runIDNote}`,
       {
         request_id: stringSchema(),
         run_id: stringSchema(),
         title: stringSchema(),
         prompt: stringSchema(),
-        agent_kind: stringSchema(),
+        agent_kind: agentKindSchema(),
         model: stringSchema(),
-        execution_mode: stringSchema(),
+        execution_mode: executionModeSchema(),
         dependencies: arraySchema(),
         interactive: booleanSchema(),
       },
@@ -455,7 +462,7 @@ export function fullToolList(): Tool[] {
     ),
     tool(
       "delegate_tasks",
-      `Atomically delegate a task batch with a parent context snapshot and optional task tree/DAG references. ${runIDNote}`,
+      `Atomically delegate a task batch with a parent context snapshot and optional task tree/DAG references. Every task sets agent_kind (${CHILD_AGENT_KINDS.join(" | ")}) and execution_mode (read_only | workspace_write). ${runIDNote}`,
       {
         request_id: stringSchema(),
         run_id: stringSchema(),
