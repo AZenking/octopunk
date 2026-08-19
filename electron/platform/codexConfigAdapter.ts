@@ -41,6 +41,16 @@ args = [${tomlArguments}]`;
     return backupURL;
   }
 
+  /** 只读探测:config.toml 是否已含 octopunk 条目(设置页连接状态徽标)。 */
+  async hasOctoPunkEntry(): Promise<boolean> {
+    try {
+      const configURL = path.join(this.homeDirectory, ".codex", "config.toml");
+      return fs.readFileSync(configURL, "utf8").includes("[mcp_servers.octopunk]");
+    } catch {
+      return false;
+    }
+  }
+
   private backupExisting(configURL: string): string | null {
     if (!fs.existsSync(configURL)) return null;
     const backup = path.join(

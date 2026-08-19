@@ -947,6 +947,11 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
     return { backupPath: backup };
   });
 
+  handle("settings:connection-status", async () => ({
+    codex: await environment.codexConfig.hasOctoPunkEntry(),
+    pi: await environment.piConfig.hasOctoPunkEntry(),
+  }));
+
   handle("http:start", async () => {
     await environment.mcpServer.startHTTP();
     return { endpoint: "http://127.0.0.1:51931/mcp" };

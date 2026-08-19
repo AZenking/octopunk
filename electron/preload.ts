@@ -48,6 +48,7 @@ const INVOKE_ALLOWLIST = new Set([
   "scheduler:settings",
   "settings:connect-codex",
   "settings:connect-pi",
+  "settings:connection-status",
   "settings:get-child-models",
   "settings:get-custom-instructions",
   "settings:get-disabled-agents",

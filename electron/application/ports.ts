@@ -428,6 +428,8 @@ export interface KeychainPort {
 export interface CodexConfigPort {
   connect(endpoint: string, tokenEnvironmentVariable: string): Promise<string | null>;
   connectStdio(command: string, arguments_: string[]): Promise<string | null>;
+  /** 只读探测 octopunk 条目是否已写入(设置页连接状态徽标)。 */
+  hasOctoPunkEntry(): Promise<boolean>;
 }
 
 export interface LoginItemPort {

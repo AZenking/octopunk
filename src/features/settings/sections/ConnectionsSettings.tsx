@@ -1,6 +1,6 @@
 // 连接与 MCP — how OctoPunk (as an MCP server) is reached: default STDIO
-// transport, the Codex config writer, the optional HTTP compatibility bridge,
-// plus a protocol reference card.
+// transport, the Codex/Pi config writers with real on-disk status badges,
+// the optional HTTP compatibility bridge, plus a protocol reference card.
 
 import { LoaderCircle } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
@@ -25,11 +25,133 @@ const PROTOCOLS: { name: string; desc: string }[] = [
   },
 ];
 
+/** settings:connection-status 载荷：两个客户端配置是否已含 octopunk 条目。 */
+interface ConnectionStatusPayload {
+  codex: boolean;
+  pi: boolean;
+}
+
 /** pr:check 通道载荷(与 electron/ipc.ts 同构的渲染层投影)。 */
 interface GhProbePayload {
   enabled: boolean;
   available: boolean;
   detail: string;
+}
+
+/** MCP 服务器分区：徽标来自配置文件真实状态（而非本次会话点击），写入后按钮转为「重新写入」。 */
+function McpServerSection() {
+  const appState = useAppState();
+  const [status, setStatus] = useState<ConnectionStatusPayload | null>(null);
+  const [busy, setBusy] = useState<"codex" | "pi" | null>(null);
+
+  const refresh = useCallback(async (): Promise<void> => {
+    try {
+      setStatus(await window.octopunk.invoke<ConnectionStatusPayload>("settings:connection-status"));
+    } catch {
+      setStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const connect = useCallback(
+    async (kind: "codex" | "pi"): Promise<void> => {
+      setBusy(kind);
+      try {
+        await (kind === "codex" ? appState.connectCodex() : appState.connectPi());
+      } finally {
+        setBusy(null);
+        void refresh();
+      }
+    },
+    [appState, refresh],
+  );
+
+  return (
+    <section>
+      <SectionLabel>OctoPunk MCP 服务器</SectionLabel>
+      <RowGroup>
+        <Row
+          title="STDIO 传输"
+          desc="本地进程直连"
+          hint="OctoPunk 作为 MCP 服务器经 STDIO 暴露全部团队工具；令牌经 Keychain 加密，通过 OCTOPUNK_MCP_TOKEN 环境变量注入受限会话。"
+          control={
+            <Badge variant="secondary" className="font-mono text-[10px]">
+              默认
+            </Badge>
+          }
+        />
+        <Row
+          title="连接 Codex"
+          desc="写入 ~/.codex/config.toml"
+          hint={
+            "向 ~/.codex/config.toml 写入命令式 STDIO 条目，原配置自动备份。" +
+            (appState.codexBackupPath != null ? `\n备份：${appState.codexBackupPath}` : "")
+          }
+          control={
+            <span className="flex items-center gap-2">
+              {status?.codex === true && (
+                <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">
+                  已写入
+                </Badge>
+              )}
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={busy != null}
+                onClick={() => void connect("codex")}
+                className="cursor-pointer"
+              >
+                {busy === "codex" ? <LoaderCircle className="animate-spin" aria-hidden /> : null}
+                {status?.codex === true ? "重新写入" : "连接 Codex"}
+              </Button>
+            </span>
+          }
+        />
+        <Row
+          title="连接 Pi"
+          desc="写入 ~/.pi/agent/mcp.json"
+          hint="向 pi 的 MCP 配置合并 octopunk STDIO 条目（eager），保留其他 server；原文件自动备份。需先安装 pi-mcp-extension 扩展（pi install npm:pi-mcp-extension），pi 本身不内置 MCP 客户端。"
+          control={
+            <span className="flex items-center gap-2">
+              {status?.pi === true && (
+                <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">
+                  已写入
+                </Badge>
+              )}
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={busy != null}
+                onClick={() => void connect("pi")}
+                className="cursor-pointer"
+              >
+                {busy === "pi" ? <LoaderCircle className="animate-spin" aria-hidden /> : null}
+                {status?.pi === true ? "重新写入" : "连接 Pi"}
+              </Button>
+            </span>
+          }
+        />
+        <Row
+          title="HTTP 兼容"
+          desc="127.0.0.1:51931/mcp"
+          hint="Bearer 令牌存 Keychain；仅显式开启，STDIO 始终为默认传输。开关即当前状态。"
+          control={
+            <Switch
+              checked={appState.isHTTPRunning}
+              onCheckedChange={(enabled) =>
+                void (enabled
+                  ? appState.startHTTPCompatibility()
+                  : appState.stopHTTPCompatibility())
+              }
+            />
+          }
+        />
+      </RowGroup>
+    </section>
+  );
 }
 
 /** GitHub 回灌分区:开关(默认关)+ gh 只读可用性探测(开启前即可用)。 */
@@ -134,63 +256,9 @@ function GithubFeedbackSection() {
 }
 
 export function ConnectionsSettings() {
-  const appState = useAppState();
-
   return (
     <div className="flex flex-col gap-8">
-      <section>
-        <SectionLabel>OctoPunk MCP 服务器</SectionLabel>
-        <RowGroup>
-          <Row
-            title="STDIO 传输"
-            desc="本地进程直连"
-            hint="OctoPunk 作为 MCP 服务器经 STDIO 暴露全部团队工具；令牌经 Keychain 加密，通过 OCTOPUNK_MCP_TOKEN 环境变量注入受限会话。"
-            control={
-              <Badge variant="secondary" className="font-mono text-[10px]">
-                默认
-              </Badge>
-            }
-          />
-          <Row
-            title="连接 Codex"
-            desc="写入 ~/.codex/config.toml"
-            hint={
-              "向 ~/.codex/config.toml 写入命令式 STDIO 条目，原配置自动备份。" +
-              (appState.codexBackupPath != null ? `\n备份：${appState.codexBackupPath}` : "")
-            }
-            control={
-              <Button variant="outline" size="sm" onClick={() => void appState.connectCodex()}>
-                连接 Codex
-              </Button>
-            }
-          />
-          <Row
-            title="连接 Pi"
-            desc="写入 ~/.pi/agent/mcp.json"
-            hint="向 pi 的 MCP 配置合并 octopunk STDIO 条目（eager），保留其他 server；原文件自动备份。需先安装 pi-mcp-extension 扩展（pi install npm:pi-mcp-extension），pi 本身不内置 MCP 客户端。"
-            control={
-              <Button variant="outline" size="sm" onClick={() => void appState.connectPi()}>
-                连接 Pi
-              </Button>
-            }
-          />
-          <Row
-            title="HTTP 兼容"
-            desc="127.0.0.1:51931/mcp"
-            hint="Bearer 令牌存 Keychain；仅显式开启，STDIO 始终为默认传输。开关即当前状态。"
-            control={
-              <Switch
-                checked={appState.isHTTPRunning}
-                onCheckedChange={(enabled) =>
-                  void (enabled
-                    ? appState.startHTTPCompatibility()
-                    : appState.stopHTTPCompatibility())
-                }
-              />
-            }
-          />
-        </RowGroup>
-      </section>
+      <McpServerSection />
 
       <GithubFeedbackSection />
 

@@ -643,8 +643,11 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     try {
       const result = await window.octopunk.invoke<{ backupPath: string | null }>("settings:connect-codex");
       setCodexBackupPath(result.backupPath);
-      setMigrationMessage(
-        "Codex MCP configured through local STDIO. HTTP compatibility is optional and remains stopped.",
+      // 反馈落在设置页(动作发生地),而非只出现在仪表盘的迁移消息里。
+      setStatusMessage(
+        `已写入 ~/.codex/config.toml（octopunk · stdio）${
+          result.backupPath != null ? "；原配置已自动备份。" : ""
+        }`,
       );
     } catch (error) {
       setErrorMessage(errorMessageOf(error));

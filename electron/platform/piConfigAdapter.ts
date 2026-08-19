@@ -39,6 +39,17 @@ export class FilePiConfigAdapter {
     return backupURL;
   }
 
+  /** 只读探测:mcp.json 是否已含 octopunk 条目(设置页连接状态徽标)。 */
+  async hasOctoPunkEntry(): Promise<boolean> {
+    try {
+      const configURL = path.join(this.homeDirectory, ".pi", "agent", "mcp.json");
+      const parsed = JSON.parse(fs.readFileSync(configURL, "utf8")) as PiMCPConfig;
+      return parsed.mcpServers?.octopunk != null;
+    } catch {
+      return false;
+    }
+  }
+
   private backupExisting(configURL: string): string | null {
     if (!fs.existsSync(configURL)) return null;
     const backup = path.join(
