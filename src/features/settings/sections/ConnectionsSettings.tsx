@@ -2,6 +2,8 @@
 // transport, the Codex config writer, the optional HTTP compatibility bridge,
 // plus a protocol reference card.
 
+import { LoaderCircle } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
 import { useAppState } from "@/appState";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -22,6 +24,114 @@ const PROTOCOLS: { name: string; desc: string }[] = [
     desc: "HTTP 传输的访问令牌，经 macOS Keychain（safeStorage）加密存储。",
   },
 ];
+
+/** pr:check 通道载荷(与 electron/ipc.ts 同构的渲染层投影)。 */
+interface GhProbePayload {
+  enabled: boolean;
+  available: boolean;
+  detail: string;
+}
+
+/** GitHub 回灌分区:开关(默认关)+ gh 只读可用性探测(开启前即可用)。 */
+function GithubFeedbackSection() {
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [probing, setProbing] = useState(false);
+  const [probe, setProbe] = useState<GhProbePayload | null>(null);
+
+  useEffect(() => {
+    let stale = false;
+    window.octopunk
+      .invoke<{ enabled: boolean }>("pr:settings")
+      .then((result) => {
+        if (!stale) setEnabled(result.enabled);
+      })
+      .catch(() => {
+        if (!stale) setEnabled(false);
+      });
+    return () => {
+      stale = true;
+    };
+  }, []);
+
+  const toggle = useCallback(async (next: boolean): Promise<void> => {
+    setEnabled(next);
+    try {
+      const result = await window.octopunk.invoke<{ enabled: boolean }>("pr:settings", { enabled: next });
+      setEnabled(result.enabled);
+    } catch {
+      // 写入失败回读当前值;分区内的降级不影响设置页其他区域。
+      try {
+        const result = await window.octopunk.invoke<{ enabled: boolean }>("pr:settings");
+        setEnabled(result.enabled);
+      } catch {
+        setEnabled(false);
+      }
+    }
+  }, []);
+
+  const runProbe = useCallback(async (): Promise<void> => {
+    setProbing(true);
+    try {
+      setProbe(await window.octopunk.invoke<GhProbePayload>("pr:check"));
+    } catch (caught) {
+      setProbe({
+        enabled: enabled === true,
+        available: false,
+        detail: caught instanceof Error ? caught.message : String(caught),
+      });
+    } finally {
+      setProbing(false);
+    }
+  }, [enabled]);
+
+  return (
+    <section>
+      <SectionLabel>GitHub 回灌</SectionLabel>
+      <RowGroup>
+        <Row
+          title="启用 GitHub 回灌"
+          desc="默认关闭（FR-016）"
+          hint="开启后可在审查中心为通过审查的任务创建 GitHub PR 并回灌 CI 状态与 Review 评论。凭证完全由本机 gh CLI 托管（gh auth login），OctoPunk 不保存任何 GitHub 凭证。"
+          control={
+            <Switch
+              checked={enabled === true}
+              disabled={enabled == null}
+              onCheckedChange={(next) => void toggle(next)}
+            />
+          }
+        />
+        <Row
+          title="gh CLI 可用性"
+          desc="只读探测 gh --version / gh auth status"
+          hint={
+            probe == null
+              ? "探测不修改任何状态,开启开关前即可执行;未安装 gh 或未登录时仅提示,不影响本地审查与门禁。"
+              : probe.detail
+          }
+          control={
+            <span className="flex items-center gap-2">
+              {probe != null && (
+                <Badge variant={probe.available ? "secondary" : "destructive"} className="px-1.5 py-0 text-[10px]">
+                  {probe.available ? "可用" : "不可用"}
+                </Badge>
+              )}
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={probing}
+                onClick={() => void runProbe()}
+                className="cursor-pointer"
+              >
+                {probing ? <LoaderCircle className="animate-spin" aria-hidden /> : null}
+                检测 gh
+              </Button>
+            </span>
+          }
+        />
+      </RowGroup>
+    </section>
+  );
+}
 
 export function ConnectionsSettings() {
   const appState = useAppState();
@@ -81,6 +191,8 @@ export function ConnectionsSettings() {
           />
         </RowGroup>
       </section>
+
+      <GithubFeedbackSection />
 
       <section>
         <SectionLabel>连接协议</SectionLabel>

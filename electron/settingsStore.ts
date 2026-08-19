@@ -79,3 +79,8 @@ export const LAUNCH_STAGGER_SECONDS_KEY = "OctoPunk.launchStaggerSeconds";
 export const CLAUDE_CHILD_MODEL_KEY = "OctoPunk.claudeChildModel";
 export const CODEX_CHILD_MODEL_KEY = "OctoPunk.codexChildModel";
 export const PI_CHILD_MODEL_KEY = "OctoPunk.piChildModel";
+/**
+ * GitHub PR 回灌开关(specs/002-v04 US4 / FR-016),布尔字符串("true" = 开启),
+ * 默认关闭。凭证由本机 gh CLI 自管,OctoPunk 不保存任何 GitHub 凭证。
+ */
+export const GITHUB_FEEDBACK_ENABLED_KEY = "OctoPunk.githubFeedbackEnabled";

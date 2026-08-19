@@ -15,8 +15,10 @@
 | `get_gate_config` | 读项目默认 + 运行快照 | `repository_path`, `run_id?` | 默认配置与该运行生效快照 |
 | `run_quality_gate` | 执行门禁判定 | `request_id`, `run_id?`, `task_id` | overall + 逐项明细(幂等,重跑生成新 evaluation) |
 | `waive_gate_item` | 豁免失败项 | `request_id`, `evaluation_id`, `item_id`, `reason` | 更新后明细(全失败项已豁免时 overall→waived) |
+| `run_review` | 按审查模式派发只读审查并收集仲裁 | `request_id`, `run_id?`, `task_id`, `mode?`(standard/cross_model/dual_readonly/contest/role_based/arbitration,缺省读运行生效配置), `contest_models?`, `collect_timeout_seconds?`(60–600,默认 300) | `{mode, review_task_ids, arbitration}`(共识/分歧/待验证 + auto_passed);standard 不派发、返回提示;超时未到齐不落库,返回可重试提示 |
 | `get_arbitration` | 读仲裁结论 | `run_id?`, `task_id` | 共识/分歧/待验证 + auto_passed |
-| `create_pr` | GitHub PR(需开启回灌) | `request_id`, `run_id?`, `task_id`, `title`, `body?` | pr_url(gh 缺失/未登录报可读错误) |
+| `create_pr` | GitHub PR(需开启回灌) | `request_id`, `run_id?`, `task_id`, `title?`(缺省 `[OctoPunk] <任务标题>`), `body?` | pr_url + pr_number(gh 缺失/未登录报可读错误) |
+| `get_pr_status` | 读任务关联 PR 状态(只读) | `run_id?`, `task_id` | 关联链接 + state/检查汇总/最近评论(无关联 → null;gh 失败报可读错误) |
 
 ## B. 既有工具语义扩展(不破坏)
 

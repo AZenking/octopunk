@@ -12,6 +12,7 @@ import { GitAdapter } from "./platform/gitAdapter";
 import { ClaudeCLIAdapter } from "./platform/claudeCliAdapter";
 import { PiCLIAdapter } from "./platform/piCliAdapter";
 import { CodexAppServerAdapter, ChildAgentRegistry } from "./platform/codexAppServerAdapter";
+import { GhCliAdapter } from "./platform/ghCliAdapter";
 import { OctoPunkToolLocator } from "./platform/toolLocator";
 import { KeychainTokenStore } from "./platform/keychainTokenStore";
 import { FileCodexConfigAdapter } from "./platform/codexConfigAdapter";
@@ -26,6 +27,7 @@ import { TeamQueryService } from "./application/teamQueryService";
 import { ContextFetchService } from "./application/contextFetchService";
 import { ReviewCenterService } from "./application/reviewCenterService";
 import { QualityGateService } from "./application/qualityGateService";
+import { ReviewModeService } from "./application/reviewModeService";
 import { TaskEventHub } from "./domain/events";
 import { OctoPunkMCPServer } from "./mcp/server";
 import {
@@ -34,6 +36,7 @@ import {
   CODEX_CHILD_MODEL_KEY,
   CODEX_EXECUTABLE_KEY,
   CUSTOM_INSTRUCTIONS_KEY,
+  GITHUB_FEEDBACK_ENABLED_KEY,
   LAUNCH_STAGGER_SECONDS_KEY,
   LEGACY_CLAUDE_EXECUTABLE_KEY,
   MAX_CONCURRENT_TASKS_KEY,
@@ -56,6 +59,7 @@ export class AppEnvironment {
   readonly repository: SqliteTeamRunRepository;
   readonly process: LocalProcessAdapter;
   readonly git: GitAdapter;
+  readonly gh: GhCliAdapter;
   readonly claude: ClaudeCLIAdapter;
   readonly codex: CodexAppServerAdapter;
   readonly pi: PiCLIAdapter;
@@ -66,6 +70,7 @@ export class AppEnvironment {
   readonly queryService: TeamQueryService;
   readonly reviewCenter: ReviewCenterService;
   readonly qualityGate: QualityGateService;
+  readonly reviewModes: ReviewModeService;
   readonly contextFetch: ContextFetchService;
   readonly eventHub: TaskEventHub;
   readonly keychain: KeychainTokenStore;
@@ -96,6 +101,13 @@ export class AppEnvironment {
     this.repository = new SqliteTeamRunRepository(this.database.writer);
     this.process = new LocalProcessAdapter();
     this.git = new GitAdapter(this.process);
+    // GitHub PR 回灌(specs/002-v04 US4 / FR-016):默认关闭;enabled 每次调用
+    // 现读设置(settings 写入会同步更新 SettingsStore 内存缓存),凭证由本机
+    // gh CLI 自管,OctoPunk 不保存任何 GitHub 凭证。
+    this.gh = new GhCliAdapter({
+      process: this.process,
+      enabled: () => this.settings.string(GITHUB_FEEDBACK_ENABLED_KEY) === "true",
+    });
     this.settings.migrateKey(LEGACY_CLAUDE_EXECUTABLE_KEY, CLAUDE_EXECUTABLE_KEY);
     // A bare configured name (e.g. "claude") resolves through the locator so
     // fnm/volta/npm-global installs are found; explicit paths are trusted.
@@ -168,10 +180,20 @@ export class AppEnvironment {
     this.queryService = new TeamQueryService(this.repository);
     // Review Center shares the same repository/git/teamService instances as the
     // MCP tools (constitution principle two) — GUI and MCP stay isomorphic.
+    // gh(可选)承担 GitHub PR 回灌用例,未启用时错误在服务层可读透传。
     this.reviewCenter = new ReviewCenterService({
       repository: this.repository,
       git: this.git,
       teamService: this.teamService,
+      gh: this.gh,
+    });
+    // 跨模型审查仲裁(User Story 3):同样共享 repository/teamService 实例,
+    // GUI 与 MCP 同构;依赖已就绪(qualityGate/reviewCenter 均已构造)。
+    this.reviewModes = new ReviewModeService({
+      repository: this.repository,
+      teamService: this.teamService,
+      gate: this.qualityGate,
+      reviewCenter: this.reviewCenter,
     });
     this.keychain = new KeychainTokenStore();
     this.codexConfig = new FileCodexConfigAdapter();
@@ -199,6 +221,7 @@ export class AppEnvironment {
       defaultMaxConcurrentTasks: () => storedDefaultMaxConcurrentTasks(this.settings),
       reviewCenter: this.reviewCenter,
       qualityGate: this.qualityGate,
+      reviewModes: this.reviewModes,
     });
   }
 

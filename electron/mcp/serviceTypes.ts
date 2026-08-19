@@ -18,6 +18,7 @@ import type {
 } from "../domain/repositoryPort";
 import type { ReviewCenterService } from "../application/reviewCenterService";
 import type { QualityGateService } from "../application/qualityGateService";
+import type { ReviewModeService } from "../application/reviewModeService";
 
 /** Read-only live context supply for sub-agents (spec 001 FR-005…FR-008). */
 export interface ReadOnlyContextPort {
@@ -78,4 +79,11 @@ export interface AgentTeamServicePortLike {
    * error instead of failing to build.
    */
   qualityGate?: QualityGateService;
+  /**
+   * Review Mode use cases (cross-model review dispatch + arbitration collect)
+   * shared by GUI and MCP (constitution principle two). Optional like the
+   * others: until appEnvironment wires the instance the review tools answer
+   * with a readable error instead of failing to build.
+   */
+  reviewModes?: ReviewModeService;
 }

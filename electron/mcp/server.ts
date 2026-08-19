@@ -16,12 +16,13 @@ import { DEFAULT_MAX_CONCURRENT_TASKS } from "../../shared/ipc";
 import type { GitDiffSide, GitPort, KeychainPort } from "../application/ports";
 import type { ReviewCenterService, ReviewCommentInput } from "../application/reviewCenterService";
 import type { QualityGateService } from "../application/qualityGateService";
+import type { ReviewModeService } from "../application/reviewModeService";
 import type { GateConfigInput } from "../domain/policy";
 import { TaskEventHub } from "../domain/events";
 import type { TaskEventUpdate } from "../domain/events";
 import { OctoPunkContextServer } from "../application/ports";
 import { stableStringify } from "../domain/events";
-import type { ReviewFinding } from "../domain/models";
+import { GATE_REVIEW_MODES, type GateReviewMode, type ReviewFinding } from "../domain/models";
 import { randomReviewFindingID } from "./ids";
 import { OctoPunkHTTPApplication } from "./httpApplication";
 
@@ -68,6 +69,8 @@ export class OctoPunkMCPServer {
     reviewCenter?: ReviewCenterService | null;
     /** Quality Gate service; when present the gate tools become available. */
     qualityGate?: QualityGateService | null;
+    /** Review Mode service; when present the review/arbitration tools become available. */
+    reviewModes?: ReviewModeService | null;
   }) {
     // Prototype-chain delegation keeps reads live against the underlying
     // service instance while exposing the optional reviewCenter field.
@@ -75,6 +78,8 @@ export class OctoPunkMCPServer {
     this.service.reviewCenter = input.reviewCenter ?? undefined;
     // Same delegation pattern for the gate service (see reviewCenter above).
     this.service.qualityGate = input.qualityGate ?? undefined;
+    // Same delegation pattern for the review mode service (see above).
+    this.service.reviewModes = input.reviewModes ?? undefined;
     this.git = input.git;
     this.keychain = input.keychain;
     this.eventHub = input.eventHub ?? null;
@@ -540,6 +545,43 @@ export function fullToolList(): Tool[] {
       ["request_id", "evaluation_id", "item_id", "reason"],
     ),
     tool(
+      "run_review",
+      `Dispatch read-only reviewers for one task per the review mode (standard | cross_model | dual_readonly | contest | role_based | arbitration; default = the run's effective gate config), wait until every reviewer reports or the collect timeout, then return the recorded arbitration (consensus/disagreements/to_verify/auto_passed). standard dispatches no reviewers and returns a notice instead. ${runIDNote}`,
+      {
+        request_id: stringSchema(),
+        run_id: stringSchema(),
+        task_id: stringSchema(),
+        mode: stringSchema(),
+        contest_models: arraySchema(),
+        collect_timeout_seconds: integerSchema(),
+      },
+      ["request_id", "task_id"],
+    ),
+    tool(
+      "get_arbitration",
+      `Read the latest recorded arbitration (consensus / disagreements / to_verify / auto_passed) for one task, or null when none exists. ${runIDNote}`,
+      { run_id: stringSchema(), task_id: stringSchema() },
+      ["task_id"],
+    ),
+    tool(
+      "create_pr",
+      `Create a GitHub PR for one reviewed task through the local gh CLI (head = the task branch, base = the run's target branch; requires the GitHub feedback switch in Settings, default off — gh missing / not authenticated returns a readable error and never affects local review). ${runIDNote}`,
+      {
+        request_id: stringSchema(),
+        run_id: stringSchema(),
+        task_id: stringSchema(),
+        title: stringSchema(),
+        body: stringSchema(),
+      },
+      ["request_id", "task_id"],
+    ),
+    tool(
+      "get_pr_status",
+      `Read the task's linked PR state, status-check rollup and latest redacted comments (null when no PR is linked; a gh failure returns a readable error). ${runIDNote}`,
+      { run_id: stringSchema(), task_id: stringSchema() },
+      ["task_id"],
+    ),
+    tool(
       "accept_task",
       `Accept a task after Codex PASS and integrate its branch. ${runIDNote}`,
       {
@@ -912,6 +954,61 @@ async function dispatchTool(
       });
       return stableStringify(evaluation);
     }
+    case "run_review": {
+      const reviewModes = requireReviewModes(service);
+      const runID = await resolveRunID(service, arguments_, sessionID);
+      const taskID = requireUUID(arguments_, "task_id");
+      // 契约不变量 2:变更类调用携带 request_id;幂等由 dispatchReview 内部
+      // 确定性派生的 requestID(review:<mode>:<taskID>:<i> + 响应缓存)承担。
+      requireString(arguments_, "request_id");
+      const dispatch = await reviewModes.dispatchReview({
+        runID,
+        taskID,
+        mode: optionalReviewMode(arguments_, "mode"),
+        contestModels: stringArray(arguments_, "contest_models"),
+      });
+      if (dispatch.reviewTaskIDs.length === 0) {
+        return stableStringify({
+          mode: dispatch.mode,
+          reviewTaskIDs: [],
+          arbitration: null,
+          note: "standard 模式不派发审查任务:走既有常规审查流(门禁检查 + 行级评论 + accept/rework)。",
+        });
+      }
+      // 轮询至全部审查任务到达可收集状态(报告就绪/待返工/终态)或超时;
+      // 到齐后再 collectArbitration(其内部等待立即返回)。超时则不落库,
+      // 返回可读提示——重放 run_review 派发幂等,可安全重试。
+      const timeoutSeconds = clampCollectTimeoutSeconds(
+        optionalInteger(arguments_, "collect_timeout_seconds"),
+      );
+      const deadline = Date.now() + timeoutSeconds * 1000;
+      let allArrived = false;
+      for (;;) {
+        allArrived = await reviewTasksArrived(reviewModes, runID, taskID, dispatch.reviewTaskIDs);
+        if (allArrived || Date.now() + RUN_REVIEW_POLL_INTERVAL_MS > deadline) break;
+        await sleep(RUN_REVIEW_POLL_INTERVAL_MS);
+      }
+      if (!allArrived) {
+        return stableStringify({
+          mode: dispatch.mode,
+          reviewTaskIDs: dispatch.reviewTaskIDs,
+          arbitration: null,
+          note: `审查任务未在 ${timeoutSeconds}s 内全部到达;重放 run_review(派发幂等)等待剩余审查,或待其完成后用 get_arbitration 读取仲裁结论。`,
+        });
+      }
+      const arbitration = await reviewModes.collectArbitration({
+        runID,
+        taskID,
+        reviewTaskIDs: dispatch.reviewTaskIDs,
+      });
+      return stableStringify({ mode: dispatch.mode, reviewTaskIDs: dispatch.reviewTaskIDs, arbitration });
+    }
+    case "get_arbitration": {
+      const reviewModes = requireReviewModes(service);
+      const runID = await resolveRunID(service, arguments_, sessionID);
+      const taskID = requireUUID(arguments_, "task_id");
+      return stableStringify(await reviewModes.getArbitration(runID, taskID));
+    }
     case "get_task_diff": {
       const review = requireReviewCenter(service);
       const side = diffSide(arguments_);
@@ -949,6 +1046,30 @@ async function dispatchTool(
         summary: requireString(arguments_, "summary"),
       });
       return stableStringify(result);
+    }
+    case "create_pr": {
+      // GitHub PR 回灌(specs/002-v04 US4 / 契约 A 节):gh 未启用/未安装/未登录
+      // 的 GhCliError 携带中文可读消息,直接透传为 isError,不影响其他工具。
+      // request_id 为契约要求的幂等语义:gh 的"already exists"分支 + savePrLink
+      // UPSERT 使重放收敛到同一 PR。
+      const review = requireReviewCenter(service);
+      requireString(arguments_, "request_id");
+      const result = await review.createPrForTask({
+        runID: await resolveRunID(service, arguments_, sessionID),
+        taskID: requireUUID(arguments_, "task_id"),
+        title: optionalString(arguments_, "title"),
+        body: optionalString(arguments_, "body"),
+      });
+      return stableStringify({ pr_url: result.url, pr_number: result.number });
+    }
+    case "get_pr_status": {
+      const review = requireReviewCenter(service);
+      const refreshed = await review.refreshPrStatus({
+        runID: await resolveRunID(service, arguments_, sessionID),
+        taskID: requireUUID(arguments_, "task_id"),
+      });
+      if (refreshed == null) return stableStringify(null);
+      return stableStringify({ link: refreshed.link, status: refreshed.status });
     }
     case "resume_task": {
       const result = await service.resumeTask({
@@ -1155,6 +1276,69 @@ function requireQualityGate(service: AgentTeamServicePortLike): QualityGateServi
     throw new Error("Quality gate tools are unavailable: the qualityGate service is not wired in this build.");
   }
   return service.qualityGate;
+}
+
+/** Review Mode tools share the team service port; until appEnvironment wires the instance they answer with a readable error. */
+function requireReviewModes(service: AgentTeamServicePortLike): ReviewModeService {
+  if (service.reviewModes == null) {
+    throw new Error("Review mode tools are unavailable: the reviewModes service is not wired in this build.");
+  }
+  return service.reviewModes;
+}
+
+/** run_review 的轮询节奏(与 ReviewModeService.collectArbitration 内部节奏一致)。 */
+const RUN_REVIEW_POLL_INTERVAL_MS = 5_000;
+
+/** run_review 的收集等待窗口:60–600s,缺省 300s。 */
+function clampCollectTimeoutSeconds(value: number | undefined): number {
+  return Math.min(600, Math.max(60, Math.round(value ?? 300)));
+}
+
+/** 可选 mode 参数:六值枚举(GATE_REVIEW_MODES),非法值给可读错误。 */
+function optionalReviewMode(arguments_: Arguments, key: string): GateReviewMode | undefined {
+  const value = arguments_[key];
+  if (value == null) return undefined;
+  if (typeof value !== "string" || !(GATE_REVIEW_MODES as readonly string[]).includes(value)) {
+    throw new InvalidParamsError(`Unsupported ${key}. Use one of: ${GATE_REVIEW_MODES.join(", ")}.`);
+  }
+  return value as GateReviewMode;
+}
+
+function stringArray(arguments_: Arguments, key: string): string[] {
+  const value = arguments_[key];
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string");
+}
+
+/** 与 ReviewModeService 的可收集判定同构:报告就绪、待返工或任一终态。 */
+function reviewTaskArrived(status: string): boolean {
+  return (
+    status === "awaiting_report" ||
+    status === "rework_required" ||
+    status === "accepted" ||
+    status === "blocked" ||
+    status === "cancelled" ||
+    status === "failed"
+  );
+}
+
+/** 指定审查任务是否全部到达可收集状态(按 latestReviewTasks 快照判定)。 */
+async function reviewTasksArrived(
+  reviewModes: ReviewModeService,
+  runID: string,
+  taskID: string,
+  reviewTaskIDs: string[],
+): Promise<boolean> {
+  const reviewTasks = await reviewModes.latestReviewTasks(runID, taskID);
+  const statuses = new Map(reviewTasks.map((task) => [task.id, task.status] as const));
+  return reviewTaskIDs.every((id) => {
+    const status = statuses.get(id);
+    return status != null && reviewTaskArrived(status);
+  });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** MCP `config` 参数 → 领域 GateConfigInput:结构透传,字段校验(含矛盾组合)留给保存时的领域 policy。 */

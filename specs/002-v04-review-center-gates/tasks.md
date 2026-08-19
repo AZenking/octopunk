@@ -88,9 +88,9 @@ description: "Task list for v0.4 Review Center 与质量门禁"
 
 **Independent Test**: quickstart.md 场景 3 —— dual_readonly 模式 + 人为分歧,验证三段结构与 auto_passed=false。
 
-- [ ] T022 [US3] 审查模式服务:`electron/application/reviewModeService.ts` —— 按 gate 配置 review_mode 将审查任务建模为只读子任务经既有 delegate 通道派发(对向/双只读/竞赛/分角色);结论聚合为 arbitrations(共识/分歧/待验证,分歧时 auto_passed=false)(deps: T005, T016)
-- [ ] T023 [P] [US3] 通道与 UI:`get_arbitration` MCP 工具 + `review:arbitration` IPC;`ArbitrationPanel.tsx` 三段结构展示(共识/分歧并排证据/待验证清单)(deps: T022)
-- [ ] T024 [US3] 测试:双只读派发、结论冲突聚合、分歧阻止自动通过(deps: T022)
+- [x] T022 [US3] 审查模式服务:`electron/application/reviewModeService.ts` —— 按 gate 配置 review_mode 将审查任务建模为只读子任务经既有 delegate 通道派发(对向/双只读/竞赛/分角色);结论聚合为 arbitrations(共识/分歧/待验证,分歧时 auto_passed=false)(deps: T005, T016)
+- [x] T023 [P] [US3] 通道与 UI:`get_arbitration` MCP 工具 + `review:arbitration` IPC;`ArbitrationPanel.tsx` 三段结构展示(共识/分歧并排证据/待验证清单)(deps: T022)
+- [x] T024 [US3] 测试:双只读派发、结论冲突聚合、分歧阻止自动通过(deps: T022)
 
 **Checkpoint**: US1–US3 全部独立可用。
 
@@ -102,16 +102,16 @@ description: "Task list for v0.4 Review Center 与质量门禁"
 
 **Independent Test**: quickstart.md 场景 4 —— 开启回灌后 create_pr + 状态回灌;关闭/卸载 gh 时可读降级。
 
-- [ ] T025 [P] [US4] gh 适配器:`electron/platform/ghCliAdapter.ts` —— createPr / prStatus / reviewComments(经本机 `gh` CLI,不存 Token;CLI 缺失/未登录返回可读错误)(depends: 无,可与 US1–US3 并行)
-- [ ] T026 [US4] 接入:`pr_links` 读写接入 reviewCenterService;`create_pr` / `pr:status` / `pr:create` MCP+IPC;设置页开关(默认 off)(deps: T025, T005)
-- [ ] T027 [US4] UI 与降级:任务详情 PR 链接与回灌状态展示;gh 不可用时本地审查不受影响的手动验证
+- [x] T025 [P] [US4] gh 适配器:`electron/platform/ghCliAdapter.ts` —— createPr / prStatus / reviewComments(经本机 `gh` CLI,不存 Token;CLI 缺失/未登录返回可读错误)(depends: 无,可与 US1–US3 并行)
+- [x] T026 [US4] 接入:`pr_links` 读写接入 reviewCenterService;`create_pr` / `pr:status` / `pr:create` MCP+IPC;设置页开关(默认 off)(deps: T025, T005)
+- [x] T027 [US4] UI 与降级:任务详情 PR 链接与回灌状态展示;gh 不可用时本地审查不受影响的手动验证
 
 ---
 
 ## Phase 7: Polish & Cross-Cutting Concerns
 
-- [ ] T028 [P] 文档:`README.md` Layout 表与 `docs/USAGE.md` 增补 Review Center / 质量门禁 / 审查模式 / 回灌章节
-- [ ] T029 全量验证:`pnpm run typecheck` + `pnpm test` 全绿;quickstart.md 四场景走查;宪法合规自查清单(UI 无原生 HTML 控件、凭证不落库、GUI/MCP 同构、新数据全落库、Swift 移植语义未重定义)
+- [x] T028 [P] 文档:`README.md` Layout 表与 `docs/USAGE.md` 增补 Review Center / 质量门禁 / 审查模式 / 回灌章节
+- [x] T029 全量验证:`pnpm run typecheck` + `pnpm test` 全绿;quickstart.md 四场景走查;宪法合规自查清单(UI 无原生 HTML 控件、凭证不落库、GUI/MCP 同构、新数据全落库、Swift 移植语义未重定义)
 
 ---
 

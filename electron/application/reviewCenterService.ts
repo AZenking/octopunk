@@ -18,6 +18,7 @@ import type {
 } from "../domain/models";
 import { DomainError, newReviewFinding } from "../domain/models";
 import type {
+  PrLink,
   ReviewCommentDraft,
   ReviewDecisionInput,
   TeamRunRepository,
@@ -106,15 +107,62 @@ export interface TeamReworkPort {
   requestRework(input: ReviewDecisionInput): Promise<ChildTaskDTO>;
 }
 
+/**
+ * GitHub PR 回灌端口(specs/002-v04 User Story 4 / FR-015):由平台层
+ * GhCliAdapter 结构性满足。凭证由本机 gh CLI 自管——端口面上没有任何
+ * token 形参,宪法「凭证不落库」在类型层面即成立。未注入(可选依赖)时
+ * PR 用例给出可读中文错误,本地审查/门禁不受影响(FR-016 降级)。
+ */
+export interface GithubPrRef {
+  url: string;
+  number: number;
+}
+
+export interface GithubStatusCheck {
+  name: string;
+  status: string;
+  conclusion: string | null;
+}
+
+export interface GithubPrComment {
+  author: string;
+  body: string;
+  createdAt: string;
+}
+
+export interface GithubPrStatus {
+  state: string;
+  statusChecks: GithubStatusCheck[];
+  comments: GithubPrComment[];
+}
+
+export interface GithubPrPort {
+  createPr(input: {
+    repositoryURL: string;
+    title: string;
+    body: string;
+    headBranch: string;
+    baseBranch: string;
+  }): Promise<GithubPrRef>;
+  prStatus(input: { repositoryURL: string; number: number }): Promise<GithubPrStatus>;
+}
+
 export class ReviewCenterService {
   private readonly repository: TeamRunRepository;
   private readonly git: GitPort;
   private readonly teamService: TeamReworkPort;
+  private readonly gh: GithubPrPort | null;
 
-  constructor(input: { repository: TeamRunRepository; git: GitPort; teamService: TeamReworkPort }) {
+  constructor(input: {
+    repository: TeamRunRepository;
+    git: GitPort;
+    teamService: TeamReworkPort;
+    gh?: GithubPrPort | null;
+  }) {
     this.repository = input.repository;
     this.git = input.git;
     this.teamService = input.teamService;
+    this.gh = input.gh ?? null;
   }
 
   /**
@@ -488,6 +536,89 @@ export class ReviewCenterService {
   /** 仲裁结论读取(共识/分歧/待验证 + auto_passed)。 */
   async getArbitration(runID: string, taskID: string): Promise<Arbitration | null> {
     return await this.repository.getArbitration(runID, taskID);
+  }
+
+  // ---- GitHub PR 回灌(specs/002-v04 User Story 4 / FR-015、FR-016)----
+
+  /** PR 关联读取直通(无关联 → null;不触碰 gh)。 */
+  async getPrLink(runID: string, taskID: string): Promise<PrLink | null> {
+    return await this.repository.getPrLink(runID, taskID);
+  }
+
+  /**
+   * 为任务创建 GitHub PR:head = 任务分支(task.branchName),base = 运行
+   * 目标分支(run.targetBranch);成功后 savePrLink UPSERT 关联。未启用/
+   * 未安装 gh/未登录的 GhCliError 原样透传(中文可读,IPC/MCP 均直接展示,
+   * 不影响本地审查与门禁)。
+   */
+  async createPrForTask(input: {
+    runID: string;
+    taskID: string;
+    title?: string;
+    body?: string;
+  }): Promise<{ url: string; number: number }> {
+    const gh = this.requireGh();
+    const { run, task } = await this.runTask(input.runID, input.taskID);
+    if (run.targetBranch.trim().length === 0) {
+      throw new Error("该运行未记录目标分支(targetBranch),无法创建 PR。");
+    }
+    const title = input.title != null && input.title.trim().length > 0 ? input.title.trim() : `[OctoPunk] ${task.title}`;
+    const body =
+      input.body != null && input.body.trim().length > 0
+        ? input.body
+        : [
+            "由 OctoPunk 审查中心创建。",
+            "",
+            `- Run:${run.task}(\`${run.id}\`)`,
+            `- 任务:${task.title}(\`${task.id}\`,第 ${task.reviewRound} 轮审查)`,
+            `- 分支:\`${task.branchName}\` → \`${run.targetBranch}\``,
+          ].join("\n");
+    const created = await gh.createPr({
+      repositoryURL: run.repositoryPath,
+      title,
+      body,
+      headBranch: task.branchName,
+      baseBranch: run.targetBranch,
+    });
+    await this.repository.savePrLink({
+      runID: input.runID,
+      taskID: input.taskID,
+      prURL: created.url,
+      prNumber: created.number,
+    });
+    return { url: created.url, number: created.number };
+  }
+
+  /**
+   * 回灌刷新:有关联 PR 时经 gh 拉取状态(state/检查/最近评论,评论已在
+   * 适配器 redact)并把 lastSyncedAt 推进(savePrLink UPSERT);无关联返回
+   * null。gh 失败按调用方需要处理——错误携带中文消息原样抛出,GUI 侧仍可
+   * 展示既有 link,本地功能不受影响。
+   */
+  async refreshPrStatus(input: {
+    runID: string;
+    taskID: string;
+  }): Promise<{ link: PrLink; status: GithubPrStatus } | null> {
+    const gh = this.requireGh();
+    const link = await this.repository.getPrLink(input.runID, input.taskID);
+    if (link == null) return null;
+    const { run } = await this.runTask(input.runID, input.taskID);
+    const status = await gh.prStatus({ repositoryURL: run.repositoryPath, number: link.prNumber });
+    const updated = await this.repository.savePrLink({
+      runID: input.runID,
+      taskID: input.taskID,
+      prURL: link.prURL,
+      prNumber: link.prNumber,
+    });
+    return { link: updated, status };
+  }
+
+  /** gh 端口守卫:未接线(构造未注入)视同未启用,给可读中文错误。 */
+  private requireGh(): GithubPrPort {
+    if (this.gh == null) {
+      throw new Error("GitHub 回灌未在设置中启用。");
+    }
+    return this.gh;
   }
 
   /** 轻量取 run + task(runSummary 不加载 reports/events/日志)。 */

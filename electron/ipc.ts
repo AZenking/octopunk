@@ -12,6 +12,7 @@ import {
   CODEX_EXECUTABLE_KEY,
   CUSTOM_INSTRUCTIONS_KEY,
   DISABLED_AGENTS_KEY,
+  GITHUB_FEEDBACK_ENABLED_KEY,
   LAUNCH_STAGGER_SECONDS_KEY,
   MAX_CONCURRENT_TASKS_KEY,
   PI_CHILD_MODEL_KEY,
@@ -19,6 +20,8 @@ import {
   TASK_RETRY_LIMIT_KEY,
 } from "./settingsStore";
 import type { AsyncStream } from "./domain/repositoryPort";
+import type { PrLink } from "./domain/repositoryPort";
+import type { GithubPrStatus } from "./application/reviewCenterService";
 import {
   clampLaunchStaggerSeconds,
   clampTaskRetryLimit,
@@ -32,6 +35,15 @@ import {
 } from "../shared/ipc";
 import type { DiffPageDTO, DiffTreeEntryDTO, GateConfigDTO, GateStartOverrideDTO } from "../shared/dtos";
 import type { GateConfigInput } from "./domain/policy";
+import { GATE_REVIEW_MODES, type GateReviewMode } from "./domain/models";
+
+/** review:run-review 的 mode 参数:六值枚举外给可读错误(领域派发按枚举分派)。 */
+function reviewModeOrThrow(value: string): GateReviewMode {
+  if (!(GATE_REVIEW_MODES as readonly string[]).includes(value)) {
+    throw new Error(`Unsupported review mode. Use one of: ${GATE_REVIEW_MODES.join(", ")}.`);
+  }
+  return value as GateReviewMode;
+}
 
 export interface RegisteredObservers {
   dispose: () => void;
@@ -94,6 +106,19 @@ function storedMaxConcurrentTasks(environment: AppEnvironment): number {
     clampMaxConcurrentTasks(environment.settings.string(MAX_CONCURRENT_TASKS_KEY)) ??
     DEFAULT_MAX_CONCURRENT_TASKS
   );
+}
+
+/** GitHub 回灌开关现读(FR-016 默认关闭;settings 写入同步更新内存缓存)。 */
+function githubFeedbackEnabled(environment: AppEnvironment): boolean {
+  return environment.settings.string(GITHUB_FEEDBACK_ENABLED_KEY) === "true";
+}
+
+/** pr:status 载荷:link 恒可展示,status 仅在 link 存在且启用时拉取,失败给可读 error。 */
+interface PrStatusPayload {
+  enabled: boolean;
+  link: PrLink | null;
+  status: GithubPrStatus | null;
+  error: string | null;
 }
 
 export function registerIpc(environment: AppEnvironment): (window: BrowserWindow) => void {
@@ -290,6 +315,113 @@ export function registerIpc(environment: AppEnvironment): (window: BrowserWindow
   handle("review:unresolved-findings", (payload) => {
     const request = payload as { runID: string; taskID: string };
     return environment.reviewCenter.unresolvedFindings(request.runID, request.taskID);
+  });
+
+  // 跨模型审查仲裁(specs/002-v04 User Story 3):与 MCP run_review/get_arbitration
+  // 共享同一 ReviewModeService(GUI 与 MCP 同构)。派发与收集分通道:dispatch 立即
+  // 返回,收集由 UI 在审查任务全部到达后触发(collect 内部等待上限 10 分钟,不
+  // 适合与派发合在一个 invoke 里阻塞 GUI)。
+  handle("review:run-review", (payload) => {
+    const request = payload as {
+      runID: string;
+      taskID: string;
+      mode?: GateReviewMode;
+      contestModels?: string[];
+    };
+    return environment.reviewModes.dispatchReview({
+      runID: request.runID,
+      taskID: request.taskID,
+      mode: request.mode != null ? reviewModeOrThrow(request.mode) : undefined,
+      contestModels: request.contestModels,
+    });
+  });
+
+  handle("review:collect-arbitration", (payload) => {
+    const request = payload as { runID: string; taskID: string; reviewTaskIDs: string[] };
+    return environment.reviewModes.collectArbitration({
+      runID: request.runID,
+      taskID: request.taskID,
+      reviewTaskIDs: request.reviewTaskIDs ?? [],
+    });
+  });
+
+  handle("review:arbitration", (payload) => {
+    const request = payload as { runID: string; taskID: string };
+    return environment.reviewModes.getArbitration(request.runID, request.taskID);
+  });
+
+  // 审查子任务轻量 DTO(标题/状态/kind;latestReviewTasks 的渲染层投影)。
+  handle("review:review-tasks", async (payload) => {
+    const request = payload as { runID: string; taskID: string };
+    const tasks = await environment.reviewModes.latestReviewTasks(request.runID, request.taskID);
+    return tasks.map((task) => ({
+      taskID: task.id,
+      title: task.title,
+      status: task.status,
+      agentKind: task.agentKind,
+      model: task.model,
+    }));
+  });
+
+  // GitHub PR 回灌(specs/002-v04 US4 / interfaces.md §C):与 MCP create_pr /
+  // get_pr_status 共享同一 ReviewCenterService + GhCliAdapter(GUI 与 MCP 同构)。
+  // 凭证由本机 gh CLI 自管;任何 gh 失败都降级为可读中文错误,不影响审查/门禁。
+  handle("pr:settings", (payload): { enabled: boolean } => {
+    const request = payload as { enabled?: boolean };
+    if (typeof request.enabled === "boolean") {
+      environment.settings.set(GITHUB_FEEDBACK_ENABLED_KEY, request.enabled ? "true" : "false");
+    }
+    return { enabled: githubFeedbackEnabled(environment) };
+  });
+
+  handle("pr:check", async (): Promise<{
+    enabled: boolean;
+    available: boolean;
+    detail: string;
+  }> => {
+    // ignoreEnabled=true:设置页在开启开关之前即可探测(只读无害探测)。
+    const availability = await environment.gh.checkAvailability(true);
+    return { enabled: githubFeedbackEnabled(environment), ...availability };
+  });
+
+  handle("pr:create", (payload): Promise<{ url: string; number: number }> => {
+    const request = payload as { runID: string; taskID: string; title?: string; body?: string };
+    return environment.reviewCenter.createPrForTask({
+      runID: request.runID,
+      taskID: request.taskID,
+      title: request.title,
+      body: request.body,
+    });
+  });
+
+  handle("pr:status", async (payload): Promise<PrStatusPayload> => {
+    const request = payload as { runID: string; taskID: string };
+    const enabled = githubFeedbackEnabled(environment);
+    const link = await environment.reviewCenter.getPrLink(request.runID, request.taskID);
+    if (link == null) return { enabled, link: null, status: null, error: null };
+    if (!enabled) {
+      return { enabled, link, status: null, error: "GitHub 回灌未在设置中启用。" };
+    }
+    try {
+      const refreshed = await environment.reviewCenter.refreshPrStatus({
+        runID: request.runID,
+        taskID: request.taskID,
+      });
+      return {
+        enabled,
+        link: refreshed?.link ?? link,
+        status: refreshed?.status ?? null,
+        error: null,
+      };
+    } catch (error) {
+      // gh 拉取失败:link 仍返回供 UI 展示,可读错误交给 UI 呈现(FR-016 降级)。
+      return {
+        enabled,
+        link,
+        status: null,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
   });
 
   // Quality Gate(specs/002-v04 interfaces.md §C):与 MCP gate 工具共享同一

@@ -25,10 +25,12 @@ import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
+import { ArbitrationPanel } from "./ArbitrationPanel";
 import { CommentPanel } from "./CommentPanel";
 import { DiffTree } from "./DiffTree";
 import { DiffViewer, type CommentAnchor, type DiffSide } from "./DiffViewer";
 import { GatePanel } from "./GatePanel";
+import { PrPanel } from "./PrPanel";
 
 const SIDE_TABS: { value: DiffSide; label: string }[] = [
   { value: "baseline", label: "基线" },
@@ -461,7 +463,10 @@ export function ReviewCenterView() {
                       onDraftClear={() => setCommentDraft(null)}
                     />
                     <SummaryPanel runID={selected.runID} taskID={selected.taskID} />
+                    {/* GitHub PR 回灌(specs/002-v04 US4):默认关闭;任何 gh 失败只降级为面板内错误条。 */}
+                    <PrPanel runID={selected.runID} taskID={selected.taskID} taskTitle={selected.title} />
                     <GatePanel runID={selected.runID} taskID={selected.taskID} />
+                    <ArbitrationPanel runID={selected.runID} taskID={selected.taskID} />
                   </div>
                 </div>
               </div>

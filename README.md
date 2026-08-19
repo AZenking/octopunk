@@ -99,6 +99,14 @@ A running sub-agent additionally receives a task-bound restricted STDIO MCP serv
 exactly two read-only tools (`get_team_context`, `get_task_report`), bound by
 `OCTOPUNK_SESSION_RUN_ID` / `OCTOPUNK_SESSION_TASK_ID` — identical to the Swift implementation.
 
+v0.4 adds the review surface on the same control plane: `get_task_diff`,
+`add_review_comments`, `request_rework_batch` (line-anchored review comments aggregated into
+rework), `set_gate_config` / `run_quality_gate` / `waive_gate_item` (project-default quality
+gates with per-item pass/fail/waived/unknown results enforced before `accept_task`),
+`run_review` / `get_arbitration` (cross-model review modes with consensus / disagreement /
+to-verify arbitration), and optional `create_pr` / `get_pr_status` (GitHub feedback via the
+local `gh` CLI, off by default, no tokens stored).
+
 ## Development
 
 Package manager: **pnpm** (11+). pnpm blocks dependency build scripts by default; the project
